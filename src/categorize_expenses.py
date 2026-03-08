@@ -4,6 +4,7 @@ import re
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -19,6 +20,8 @@ HEADER_KEYWORDS = [
 # Flexible date tokens (dd/mm/yy, dd-mm-yyyy, yyyy-mm-dd, etc.)
 DATE_TOKEN_REGEX = re.compile(r"^\s*(\d{1,4}[-/]\d{1,2}[-/]\d{1,4})\s*$")
 
+DEFAULT_MASTER_LEDGER_PATH = "data/processed/master_ledger.csv"
+
 
 def find_header_row(df: pd.DataFrame) -> int:
     for idx, row in df.iterrows():
@@ -26,6 +29,61 @@ def find_header_row(df: pd.DataFrame) -> int:
         if all(k in line for k in HEADER_KEYWORDS):
             return idx
     raise ValueError("Could not find transaction header row in statement.")
+
+
+def extract_statement_metadata(raw: pd.DataFrame, header_row: int, source_path: str) -> Dict[str, str]:
+    """Extract account metadata from rows above the transaction header.
+
+    Works for the HDFC export format where account details appear in the first ~20 rows.
+    """
+    header_block = raw.iloc[:header_row].astype(str)
+    flat_text = "\n".join(
+        " ".join([c for c in row.tolist() if c and c != "nan"]) for _, row in header_block.iterrows()
+    )
+
+    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
+    account_no = account_no_match.group(1) if account_no_match else ""
+    last4 = account_no[-4:] if len(account_no) >= 4 else ""
+
+    # Holder name: take the first non-empty cell that looks like a name line.
+    # We keep it exactly as in the file (no normalization), per user preference.
+    holder_raw = ""
+    for _, row in header_block.iterrows():
+        for cell in row.tolist():
+            if not cell or cell == "nan":
+                continue
+            s = str(cell).strip()
+            # heuristic: contains letters and at least one space, but not a label with ':'
+            if ":" in s:
+                continue
+            if re.search(r"[A-Za-z]", s) and len(s) >= 6 and (" " in s):
+                holder_raw = s
+                break
+        if holder_raw:
+            break
+
+    downloaded_on = extract_download_date_from_filename(Path(source_path).name) or ""
+
+    return {
+        "AccountHolderRaw": holder_raw,
+        "AccountNumber": account_no,
+        "AccountLast4": last4,
+        "DownloadedOn": downloaded_on,
+        "SourceFile": Path(source_path).name,
+    }
+
+
+def extract_download_date_from_filename(filename: str) -> str:
+    """Extract download date from filenames like `..._08032026.xls` -> 2026-03-08.
+
+    Returns ISO date string (YYYY-MM-DD) or empty string.
+    """
+    m = re.search(r"_(\d{2})(\d{2})(\d{4})\.(xls|xlsx)$", filename, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+    dt = pd.to_datetime(f"{dd}/{mm}/{yyyy}", dayfirst=True, errors="coerce")
+    return dt.date().isoformat() if pd.notna(dt) else ""
 
 
 def looks_like_date(value) -> bool:
@@ -55,6 +113,7 @@ def looks_like_date(value) -> bool:
 def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFrame:
     raw = pd.read_excel(input_path, sheet_name=sheet_name, header=None)
     header_row = find_header_row(raw)
+    meta = extract_statement_metadata(raw, header_row, input_path)
 
     tx = raw.iloc[header_row + 2 :].copy()  # skip separator row of *****
     tx = tx.iloc[:, :7]
@@ -81,6 +140,10 @@ def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFram
     tx["Amount"] = tx["DepositAmt"] - tx["WithdrawalAmt"]
     tx["Flow"] = tx["Amount"].apply(lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL"))
 
+    # Attach statement-level metadata to every transaction row
+    for k, v in meta.items():
+        tx[k] = v
+
     # Core derived fields from narration.
     derived = tx["Narration"].apply(extract_narration_features).apply(pd.Series)
     tx = pd.concat([tx, derived], axis=1)
@@ -93,6 +156,80 @@ def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFram
     tx = tx.drop(columns=["ValueDate"])  # explicitly keep one date only
 
     return tx
+
+
+def list_input_files(input_path: Optional[str], input_dir: Optional[str]) -> List[str]:
+    if input_path:
+        return [input_path]
+    if not input_dir:
+        raise ValueError("Provide either --input or --input-dir")
+
+    p = Path(input_dir)
+    if not p.exists():
+        raise ValueError(f"Input dir does not exist: {input_dir}")
+
+    patterns = ["Acct_Statement_*.xls", "Acct_Statement_*.xlsx", "Statement_*.xls", "Statement_*.xlsx"]
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(list(p.glob(pat)))
+    files = sorted({f.resolve() for f in files})
+    return [str(f) for f in files]
+
+
+def compute_dedupe_key(df: pd.DataFrame) -> pd.Series:
+    ref = df.get("RefNo")
+    has_ref = ref.notna() & (ref.astype(str).str.strip() != "")
+
+    key_primary = (
+        df.get("AccountLast4", "").astype(str).fillna("")
+        + "|"
+        + ref.astype(str).fillna("")
+    )
+
+    key_fallback = (
+        df.get("AccountLast4", "").astype(str).fillna("")
+        + "|"
+        + df.get("Date").astype(str).fillna("")
+        + "|"
+        + df.get("Amount").astype(str).fillna("")
+        + "|"
+        + df.get("Narration").astype(str).fillna("")
+    )
+
+    return key_primary.where(has_ref, key_fallback)
+
+
+def safe_write_csv(df: pd.DataFrame, path: str):
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(out)
+
+
+def update_master_ledger(master_path: str, new_rows: pd.DataFrame) -> pd.DataFrame:
+    master_file = Path(master_path)
+    master_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if master_file.exists():
+        existing = pd.read_csv(master_file)
+    else:
+        existing = pd.DataFrame()
+
+    combined = pd.concat([existing, new_rows], ignore_index=True)
+    combined["DedupeKey"] = compute_dedupe_key(combined)
+    combined = combined.drop_duplicates(subset=["DedupeKey"], keep="last").reset_index(drop=True)
+
+    # backup then atomic write
+    if master_file.exists():
+        backup = master_file.with_name(master_file.stem + ".backup" + master_file.suffix)
+        master_file.replace(backup)
+        # after backup, write new
+        safe_write_csv(combined, str(master_file))
+    else:
+        safe_write_csv(combined, str(master_file))
+
+    return combined
 
 
 def extract_narration_features(narration: str) -> dict:
@@ -298,18 +435,33 @@ def save_outputs(categorized: pd.DataFrame, summary: pd.DataFrame, output_path: 
 
 def main():
     parser = argparse.ArgumentParser(description="Categorize bank statement transactions with mapping-first logic.")
-    parser.add_argument("--input", required=True, help="Absolute path to input statement (.xls/.xlsx/.csv*)")
+    parser.add_argument("--input", required=False, help="Path to a single input statement (.xls/.xlsx)")
+    parser.add_argument("--input-dir", default=None, help="Directory containing downloaded statements (default: none)")
     parser.add_argument("--sheet", default="Sheet 1", help="Excel sheet name (default: Sheet 1)")
     parser.add_argument("--mapping", default="config/category_mapping.json", help="Mapping JSON file path")
+    parser.add_argument("--master-ledger", default=DEFAULT_MASTER_LEDGER_PATH, help="Cumulative master ledger path")
     parser.add_argument(
         "--output", default="data/processed/categorized_transactions.xlsx", help="Output workbook path"
     )
     parser.add_argument("--summary", default="data/processed/category_summary.xlsx", help="Summary output path")
     args = parser.parse_args()
 
-    tx = parse_statement(args.input, args.sheet)
+    input_files = list_input_files(args.input, args.input_dir)
+    if not input_files:
+        raise ValueError("No input files found. Provide --input or use --input-dir with matching files.")
+
+    # Parse all input statements into a single dataframe
+    parsed = [parse_statement(p, args.sheet) for p in input_files]
+    tx_new = pd.concat(parsed, ignore_index=True) if parsed else pd.DataFrame()
+
+    # Update master ledger (dedupe across runs) then rebuild outputs from it
+    tx_master = update_master_ledger(args.master_ledger, tx_new) if not tx_new.empty else pd.DataFrame()
+
+    if tx_master.empty:
+        raise ValueError("No transactions found after parsing.")
+
     rules = load_mapping(args.mapping)
-    categorized = categorize_with_mapping(tx, rules)
+    categorized = categorize_with_mapping(tx_master, rules)
     categorized = detect_reversal_pairs(categorized)
     summary = create_summary(categorized)
     save_outputs(categorized, summary, args.output, args.summary)

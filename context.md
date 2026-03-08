@@ -40,6 +40,8 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 ## Current script status
 - `src/categorize_expenses.py` exists and currently supports:
   - HDFC-style parsing (table detection + footer filtering)
+  - Statement metadata extraction: `AccountHolderRaw`, `AccountNumber`, `AccountLast4`, `DownloadedOn`, `SourceFile`
+  - Multi-file ingestion from `data/raw/` and cumulative de-duped master ledger
   - Mapping-first categorization via `config/category_mapping.json`
   - Basic narration-derived fields: `PaymentMode`, `CounterpartyGuess`, `UPIHandle`, `TxnIdGuess`
   - Review/QA fields: `Flow` (inflow/outflow/neutral), `NeedsReview` + `ReviewReason`
@@ -55,6 +57,12 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 ## Validation loop
 - First run will likely have low coverage until mappings grow.
 - Use `qa_summary` (coverage %) + `review_queue` (rows needing mapping) to iteratively expand `config/category_mapping.json` and re-run.
+
+## Master ledger / de-dupe
+- Each run can ingest all files in `data/raw/` and update a cumulative master ledger (gitignored): `data/processed/master_ledger.csv`.
+- De-dupe strategy:
+  - Primary: (`AccountLast4`, `RefNo`) when `RefNo` is present
+  - Fallback: (`AccountLast4`, `Date`, `Amount`, `Narration`)
 
 ## Security / Git Hygiene
 Never commit:

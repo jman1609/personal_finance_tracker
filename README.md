@@ -31,6 +31,18 @@ python src/categorize_expenses.py \
   --summary "data/processed/category_summary.xlsx"
 ```
 
+### Run on a folder (recommended)
+
+This will ingest all matching statement files in `data/raw/`, update a local cumulative
+master ledger (gitignored), de-dupe, and rebuild outputs from the master ledger.
+
+```bash
+./.venv/bin/python src/categorize_expenses.py \
+  --input-dir data/raw \
+  --sheet "Sheet 1" \
+  --master-ledger data/processed/master_ledger.csv
+```
+
 ### Run without AI (mapping only)
 
 ```bash
