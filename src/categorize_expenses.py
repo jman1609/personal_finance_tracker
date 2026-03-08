@@ -23,6 +23,33 @@ DATE_TOKEN_REGEX = re.compile(r"^\s*(\d{1,4}[-/]\d{1,2}[-/]\d{1,4})\s*$")
 DEFAULT_MASTER_LEDGER_PATH = "data/processed/master_ledger.csv"
 
 
+def normalize_account_last4(value: str) -> str:
+    s = "" if value is None else str(value).strip()
+    digits = re.sub(r"\D+", "", s)
+    return digits.zfill(4)[-4:] if digits else ""
+
+
+def normalize_refno(value) -> str:
+    """Normalize reference numbers to a stable string.
+
+    Excel may parse them as ints/floats; we want a consistent representation
+    across different statement downloads.
+    """
+    if pd.isna(value):
+        return ""
+    # Numeric -> integer string
+    if isinstance(value, (int, float)):
+        try:
+            return str(int(value))
+        except Exception:
+            return str(value).strip()
+    s = str(value).strip()
+    # Often purely numeric
+    if re.fullmatch(r"\d+", s):
+        return s.lstrip("0") or "0"
+    return s
+
+
 def find_header_row(df: pd.DataFrame) -> int:
     for idx, row in df.iterrows():
         line = " | ".join([str(v).strip().lower() for v in row.tolist() if pd.notna(v)])
@@ -43,7 +70,7 @@ def extract_statement_metadata(raw: pd.DataFrame, header_row: int, source_path: 
 
     account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
     account_no = account_no_match.group(1) if account_no_match else ""
-    last4 = account_no[-4:] if len(account_no) >= 4 else ""
+    last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
 
     # Holder name: take the first non-empty cell that looks like a name line.
     # We keep it exactly as in the file (no normalization), per user preference.
@@ -131,18 +158,23 @@ def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFram
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
 
     # Keep only one date column (Date). Drop ValueDate as requested.
-    tx["Date"] = pd.to_datetime(tx["Date"].astype(str).str.strip(), errors="coerce", dayfirst=True)
+    # Avoid turning numeric Excel serials into strings; parse directly.
+    tx["Date"] = pd.to_datetime(tx["Date"], errors="coerce", dayfirst=True)
 
     for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
         tx[col] = pd.to_numeric(tx[col], errors="coerce").fillna(0.0)
 
     tx["Narration"] = tx["Narration"].astype(str).str.strip()
+    tx["RefNo"] = tx["RefNo"].apply(normalize_refno)
     tx["Amount"] = tx["DepositAmt"] - tx["WithdrawalAmt"]
     tx["Flow"] = tx["Amount"].apply(lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL"))
 
     # Attach statement-level metadata to every transaction row
     for k, v in meta.items():
         tx[k] = v
+
+    # Normalize last4 after metadata is attached
+    tx["AccountLast4"] = tx.get("AccountLast4", "").apply(normalize_account_last4)
 
     # Core derived fields from narration.
     derived = tx["Narration"].apply(extract_narration_features).apply(pd.Series)
@@ -177,6 +209,11 @@ def list_input_files(input_path: Optional[str], input_dir: Optional[str]) -> Lis
 
 
 def compute_dedupe_key(df: pd.DataFrame) -> pd.Series:
+    # Ensure consistent types/format
+    df = df.copy()
+    df["AccountLast4"] = df.get("AccountLast4", "").apply(normalize_account_last4)
+    df["RefNo"] = df.get("RefNo").apply(normalize_refno)
+
     ref = df.get("RefNo")
     has_ref = ref.notna() & (ref.astype(str).str.strip() != "")
 
@@ -213,8 +250,21 @@ def update_master_ledger(master_path: str, new_rows: pd.DataFrame) -> pd.DataFra
 
     if master_file.exists():
         existing = pd.read_csv(master_file)
+        # normalize critical fields from historical runs
+        if "AccountLast4" in existing.columns:
+            existing["AccountLast4"] = existing["AccountLast4"].apply(normalize_account_last4)
+        if "RefNo" in existing.columns:
+            existing["RefNo"] = existing["RefNo"].apply(normalize_refno)
     else:
         existing = pd.DataFrame()
+
+    # Ensure new_rows has normalized key fields too
+    if "AccountLast4" in new_rows.columns:
+        new_rows = new_rows.copy()
+        new_rows["AccountLast4"] = new_rows["AccountLast4"].apply(normalize_account_last4)
+    if "RefNo" in new_rows.columns:
+        new_rows = new_rows.copy()
+        new_rows["RefNo"] = new_rows["RefNo"].apply(normalize_refno)
 
     combined = pd.concat([existing, new_rows], ignore_index=True)
     combined["DedupeKey"] = compute_dedupe_key(combined)
@@ -456,6 +506,14 @@ def main():
 
     # Update master ledger (dedupe across runs) then rebuild outputs from it
     tx_master = update_master_ledger(args.master_ledger, tx_new) if not tx_new.empty else pd.DataFrame()
+
+    # Basic visibility into de-dupe effect
+    parsed_rows = len(tx_new)
+    master_rows = len(tx_master)
+    removed = parsed_rows - master_rows
+    print(f"Parsed rows (this run): {parsed_rows}")
+    print(f"Master ledger rows (after de-dupe): {master_rows}")
+    print(f"Duplicates removed: {removed if removed > 0 else 0}")
 
     if tx_master.empty:
         raise ValueError("No transactions found after parsing.")
