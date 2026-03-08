@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+expense_venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Secrets
+.env
+
+# Sensitive + generated data
+data/raw/
+data/processed/
+
+# Optional sample data is safe to commit only if anonymized
+# data/samples/

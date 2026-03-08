@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {"pattern": "SWIGGY", "category": "Food", "subcategory": "Food Delivery", "merchant": "Swiggy"},
+    {"pattern": "ZOMATO", "category": "Food", "subcategory": "Food Delivery", "merchant": "Zomato"},
+    {"pattern": "UBER", "category": "Transport", "subcategory": "Taxi", "merchant": "Uber"},
+    {"pattern": "OLA", "category": "Transport", "subcategory": "Taxi", "merchant": "Ola"},
+    {"pattern": "AMAZON", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Amazon"},
+    {"pattern": "FLIPKART", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Flipkart"},
+    {"pattern": "GROWW", "category": "Investments", "subcategory": "Mutual Funds", "merchant": "Groww"},
+    {"pattern": "PAYTM", "category": "Transfers", "subcategory": "Wallet", "merchant": "Paytm"}
+  ]
+}
