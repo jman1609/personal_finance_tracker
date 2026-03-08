@@ -7,6 +7,18 @@
     {"pattern": "AMAZON", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Amazon"},
     {"pattern": "FLIPKART", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Flipkart"},
     {"pattern": "GROWW", "category": "Investments", "subcategory": "Mutual Funds", "merchant": "Groww"},
-    {"pattern": "PAYTM", "category": "Transfers", "subcategory": "Wallet", "merchant": "Paytm"}
+    {"pattern": "PAYTM", "category": "Transfers", "subcategory": "Wallet", "merchant": "Paytm"},
+
+    {"pattern": "SPOTIFY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Spotify"},
+    {"pattern": "NETFLIX", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Netflix"},
+    {"pattern": "GOOGLE PLAY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Google Play"},
+    {"pattern": "GOOGLEPLAY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Google Play"},
+    {"pattern": "APPLE MEDIA SERVICES", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Apple Media Services"},
+
+    {"pattern": "IND*MICROSOFT", "category": "Software", "subcategory": "Subscriptions", "merchant": "Microsoft"},
+    {"pattern": "MICROSOFT", "category": "Software", "subcategory": "Subscriptions", "merchant": "Microsoft"},
+
+    {"pattern": "AGODA", "category": "Travel", "subcategory": "Hotel", "merchant": "Agoda"},
+    {"pattern": "BLINKIT", "category": "Groceries", "subcategory": "Instant Delivery", "merchant": "Blinkit"}
   ]
 }
