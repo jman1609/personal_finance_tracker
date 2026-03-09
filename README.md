@@ -1,6 +1,8 @@
 # Personal Finance Tracker (AI Expense Categorizer)
 
-This project reads bank/credit-card transactions from CSV/XLSX, normalizes transactions, applies keyword mapping, and uses OpenAI for uncategorized rows.
+This project reads bank/credit-card transactions from **XLS/XLSX** statements, normalizes transactions, applies keyword mapping, and produces clean outputs for analysis.
+
+> Upcoming: optional OpenAI-assisted categorization for uncategorized rows.
 
 ## Safe project structure
 
@@ -45,6 +47,6 @@ master ledger (gitignored), de-dupe, and rebuild outputs from the master ledger.
 
 ### Run without AI (mapping only)
 
-```bash
-python src/categorize_expenses.py --input "/absolute/path/to/file.xlsx" --no-ai
-```
+OpenAI support is not wired yet, so the current script runs mapping-only by default.
+
+> Planned: a `--no-ai` flag once the OpenAI pass is added.

@@ -4,8 +4,8 @@
 Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS/XLSX), auto-categorizes transactions, and produces clean outputs for analysis.
 
 ## Current Direction
-- Start with AI-assisted categorization (OpenAI) for uncategorized rows.
-- Gradually move toward a persistent editable mapping file (`config/category_mapping.json`) so future runs rely less on AI and become deterministic.
+- Current implementation: **mapping-first** categorization using a persistent editable mapping file (`config/category_mapping.json`).
+- Upcoming: an optional **OpenAI-assisted** pass for uncategorized rows.
 
 ## Expected Inputs
 - CSV / XLS / XLSX transaction files.
@@ -60,9 +60,9 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 
 ## Master ledger / de-dupe
 - Each run can ingest all files in `data/raw/` and update a cumulative master ledger (gitignored): `data/processed/master_ledger.csv`.
-- De-dupe strategy:
-  - Primary: (`AccountLast4`, `RefNo`) when `RefNo` is present
-  - Fallback: (`AccountLast4`, `Date`, `Amount`, `Narration`)
+- De-dupe strategy (implemented):
+  - A stable key built from: `AccountLast4`, `Date`, `Narration`, `RefNo`, `WithdrawalAmt`, `DepositAmt`, `ClosingBalance`
+  - Statement metadata like `SourceFile` / `DownloadedOn` is intentionally excluded so re-downloading the same statement doesn't create duplicates.
 
 ## Security / Git Hygiene
 Never commit:
