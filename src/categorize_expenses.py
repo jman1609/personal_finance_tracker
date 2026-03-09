@@ -4,7 +4,7 @@ import re
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -17,37 +17,39 @@ HEADER_KEYWORDS = [
     "closing balance",
 ]
 
-# Flexible date tokens (dd/mm/yy, dd-mm-yyyy, yyyy-mm-dd, etc.)
-DATE_TOKEN_REGEX = re.compile(r"^\s*(\d{1,4}[-/]\d{1,2}[-/]\d{1,4})\s*$")
-
 DEFAULT_MASTER_LEDGER_PATH = "data/processed/master_ledger.csv"
+
+# Master ledger should contain only raw transaction-table columns + account metadata.
+MASTER_LEDGER_COLUMNS = [
+    "AccountHolderRaw",
+    "AccountNumber",
+    "AccountLast4",
+    "DownloadedOn",
+    "SourceFile",
+    "Date",
+    "Narration",
+    "RefNo",
+    "WithdrawalAmt",
+    "DepositAmt",
+    "ClosingBalance",
+]
+
+# De-dupe should exclude SourceFile/DownloadedOn (they differ across downloads).
+DEDUPE_KEY_COLUMNS = [
+    "AccountLast4",
+    "Date",
+    "Narration",
+    "RefNo",
+    "WithdrawalAmt",
+    "DepositAmt",
+    "ClosingBalance",
+]
 
 
 def normalize_account_last4(value: str) -> str:
     s = "" if value is None else str(value).strip()
     digits = re.sub(r"\D+", "", s)
     return digits.zfill(4)[-4:] if digits else ""
-
-
-def normalize_refno(value) -> str:
-    """Normalize reference numbers to a stable string.
-
-    Excel may parse them as ints/floats; we want a consistent representation
-    across different statement downloads.
-    """
-    if pd.isna(value):
-        return ""
-    # Numeric -> integer string
-    if isinstance(value, (int, float)):
-        try:
-            return str(int(value))
-        except Exception:
-            return str(value).strip()
-    s = str(value).strip()
-    # Often purely numeric
-    if re.fullmatch(r"\d+", s):
-        return s.lstrip("0") or "0"
-    return s
 
 
 def find_header_row(df: pd.DataFrame) -> int:
@@ -137,6 +139,40 @@ def looks_like_date(value) -> bool:
     return pd.notna(dt)
 
 
+def parse_date_series(values: pd.Series) -> pd.Series:
+    """Parse a statement Date column into pandas datetime.
+
+    Handles:
+      - Timestamp/date/datetime objects
+      - Excel serial dates (numbers)
+      - Common string formats (dayfirst)
+
+    Returns a datetime64[ns] series (NaT where unparseable).
+    """
+    if values is None:
+        return pd.Series(dtype="datetime64[ns]")
+
+    s = values.copy()
+
+    # 1) Excel serials / numeric values
+    is_num = s.apply(lambda x: isinstance(x, (int, float)) and not pd.isna(x))
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if is_num.any():
+        out.loc[is_num] = pd.to_datetime(
+            s.loc[is_num].astype(float), unit="D", origin="1899-12-30", errors="coerce"
+        )
+
+    # 2) Everything else: let pandas parse strings/datetimes
+    rest = ~is_num
+    if rest.any():
+        # Avoid turning NaN into "nan" strings
+        rest_vals = s.loc[rest]
+        rest_dt = pd.to_datetime(rest_vals, errors="coerce", dayfirst=True)
+        out.loc[rest] = rest_dt
+
+    return out
+
+
 def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFrame:
     raw = pd.read_excel(input_path, sheet_name=sheet_name, header=None)
     header_row = find_header_row(raw)
@@ -157,37 +193,60 @@ def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFram
     # Keep rows where first column resembles a date in any common format.
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
 
-    # Keep only one date column (Date). Drop ValueDate as requested.
-    # Avoid turning numeric Excel serials into strings; parse directly.
-    tx["Date"] = pd.to_datetime(tx["Date"], errors="coerce", dayfirst=True)
+    # Keep only one date column in master ledger.
+    tx = tx.drop(columns=["ValueDate"])
 
+    # Normalize types for master ledger storage:
+    #   - Date: keep as datetime64[ns] (stable, easy enrichment later)
+    #   - Everything else: keep as strings
+    tx["Date"] = parse_date_series(tx["Date"])
+
+    tx["Narration"] = tx["Narration"].apply(
+        lambda x: "" if pd.isna(x) else re.sub(r"\s+", " ", str(x).strip())
+    )
+    # Keep RefNo as raw-ish string (do not normalize to int), to match manual de-dupe.
+    tx["RefNo"] = tx["RefNo"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+
+    # Amount columns: keep as strings (strip, remove commas)
     for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
-        tx[col] = pd.to_numeric(tx[col], errors="coerce").fillna(0.0)
-
-    tx["Narration"] = tx["Narration"].astype(str).str.strip()
-    tx["RefNo"] = tx["RefNo"].apply(normalize_refno)
-    tx["Amount"] = tx["DepositAmt"] - tx["WithdrawalAmt"]
-    tx["Flow"] = tx["Amount"].apply(lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL"))
+        s = tx[col].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+        tx[col] = s.str.replace(",", "", regex=False)
 
     # Attach statement-level metadata to every transaction row
     for k, v in meta.items():
         tx[k] = v
 
-    # Normalize last4 after metadata is attached
     tx["AccountLast4"] = tx.get("AccountLast4", "").apply(normalize_account_last4)
 
-    # Core derived fields from narration.
-    derived = tx["Narration"].apply(extract_narration_features).apply(pd.Series)
-    tx = pd.concat([tx, derived], axis=1)
+    # Keep only master-ledger columns
+    return tx[MASTER_LEDGER_COLUMNS].copy()
 
-    # Practical columns for downstream analysis.
-    tx["Year"] = tx["Date"].dt.year
-    tx["Month"] = tx["Date"].dt.to_period("M").astype(str)
-    tx["Day"] = tx["Date"].dt.day_name()
 
-    tx = tx.drop(columns=["ValueDate"])  # explicitly keep one date only
+def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived fields used for categorization + reporting.
 
-    return tx
+    Master ledger is kept minimal (raw columns + metadata). This function builds
+    the enriched view used for categorization outputs.
+    """
+    df = master_df.copy()
+
+    # Master ledger Date should be datetime, but may come back from CSV as strings.
+    if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+        df["Date"] = parse_date_series(df["Date"])
+    for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df["Narration"] = df["Narration"].astype(str).str.strip()
+
+    df["Amount"] = df["DepositAmt"] - df["WithdrawalAmt"]
+    df["Flow"] = df["Amount"].apply(lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL"))
+
+    derived = df["Narration"].apply(extract_narration_features).apply(pd.Series)
+    df = pd.concat([df, derived], axis=1)
+
+    df["Year"] = df["Date"].dt.year
+    df["Month"] = df["Date"].dt.to_period("M").astype(str)
+    df["Day"] = df["Date"].dt.day_name()
+    return df
 
 
 def list_input_files(input_path: Optional[str], input_dir: Optional[str]) -> List[str]:
@@ -209,31 +268,36 @@ def list_input_files(input_path: Optional[str], input_dir: Optional[str]) -> Lis
 
 
 def compute_dedupe_key(df: pd.DataFrame) -> pd.Series:
-    # Ensure consistent types/format
-    df = df.copy()
-    df["AccountLast4"] = df.get("AccountLast4", "").apply(normalize_account_last4)
-    df["RefNo"] = df.get("RefNo").apply(normalize_refno)
+    """De-dupe key for master ledger.
 
-    ref = df.get("RefNo")
-    has_ref = ref.notna() & (ref.astype(str).str.strip() != "")
+    User requirement: de-dupe using *transaction identity* columns only (not SourceFile,
+    DownloadedOn, or other statement metadata).
+    """
+    work = df.copy()
 
-    key_primary = (
-        df.get("AccountLast4", "").astype(str).fillna("")
-        + "|"
-        + ref.astype(str).fillna("")
-    )
+    # Ensure all columns exist
+    for c in MASTER_LEDGER_COLUMNS:
+        if c not in work.columns:
+            work[c] = ""
 
-    key_fallback = (
-        df.get("AccountLast4", "").astype(str).fillna("")
-        + "|"
-        + df.get("Date").astype(str).fillna("")
-        + "|"
-        + df.get("Amount").astype(str).fillna("")
-        + "|"
-        + df.get("Narration").astype(str).fillna("")
-    )
+    # Normalize minimal formatting (dedupe-key columns only)
+    work["AccountLast4"] = work["AccountLast4"].apply(normalize_account_last4)
+    # Normalize Date to a stable string for keying.
+    dt = parse_date_series(work["Date"])
+    # If anything comes through tz-aware, make it naive before .date conversion.
+    try:
+        if hasattr(dt.dt, "tz") and dt.dt.tz is not None:
+            dt = dt.dt.tz_localize(None)
+    except Exception:
+        # Best-effort hardening; if tz handling fails, continue with parsed dt.
+        pass
+    work["Date"] = dt.dt.date.astype(str).where(dt.notna(), "")
+    work["Narration"] = work["Narration"].apply(lambda x: "" if pd.isna(x) else re.sub(r"\s+", " ", str(x).strip()))
+    work["RefNo"] = work["RefNo"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+    for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
+        work[col] = work[col].apply(lambda x: "" if pd.isna(x) else str(x).strip())
 
-    return key_primary.where(has_ref, key_fallback)
+    return work[DEDUPE_KEY_COLUMNS].astype(str).agg("|".join, axis=1)
 
 
 def safe_write_csv(df: pd.DataFrame, path: str):
@@ -244,40 +308,59 @@ def safe_write_csv(df: pd.DataFrame, path: str):
     tmp.replace(out)
 
 
+def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
+    """Safely write a CSV and keep a backup of any existing file.
+
+    Order of operations:
+      1) write new content to <final>.tmp
+      2) move existing <final> to <final>.backup
+      3) move <final>.tmp to <final>
+    """
+    out = Path(final_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+
+    if out.exists():
+        backup = out.with_name(out.stem + ".backup" + out.suffix)
+        out.replace(backup)
+
+    tmp.replace(out)
+
+
 def update_master_ledger(master_path: str, new_rows: pd.DataFrame) -> pd.DataFrame:
     master_file = Path(master_path)
     master_file.parent.mkdir(parents=True, exist_ok=True)
 
     if master_file.exists():
-        existing = pd.read_csv(master_file)
-        # normalize critical fields from historical runs
+        # Read as strings to preserve exact raw values as much as possible
+        existing = pd.read_csv(master_file, dtype=str).fillna("")
         if "AccountLast4" in existing.columns:
             existing["AccountLast4"] = existing["AccountLast4"].apply(normalize_account_last4)
-        if "RefNo" in existing.columns:
-            existing["RefNo"] = existing["RefNo"].apply(normalize_refno)
+        if "Date" in existing.columns:
+            existing["Date"] = parse_date_series(existing["Date"])
     else:
         existing = pd.DataFrame()
 
-    # Ensure new_rows has normalized key fields too
+    new_rows = new_rows.copy()
     if "AccountLast4" in new_rows.columns:
-        new_rows = new_rows.copy()
         new_rows["AccountLast4"] = new_rows["AccountLast4"].apply(normalize_account_last4)
-    if "RefNo" in new_rows.columns:
-        new_rows = new_rows.copy()
-        new_rows["RefNo"] = new_rows["RefNo"].apply(normalize_refno)
+    if "Date" in new_rows.columns and not pd.api.types.is_datetime64_any_dtype(new_rows["Date"]):
+        new_rows["Date"] = parse_date_series(new_rows["Date"])
 
     combined = pd.concat([existing, new_rows], ignore_index=True)
-    combined["DedupeKey"] = compute_dedupe_key(combined)
-    combined = combined.drop_duplicates(subset=["DedupeKey"], keep="last").reset_index(drop=True)
+    # Keep only master-ledger columns in the stored dataset
+    keep_cols = [c for c in MASTER_LEDGER_COLUMNS if c in combined.columns]
+    combined = combined[keep_cols].copy()
+    combined["_DedupeKey"] = compute_dedupe_key(combined)
+    combined = combined.drop_duplicates(subset=["_DedupeKey"], keep="last").drop(columns=["_DedupeKey"]).reset_index(
+        drop=True
+    )
 
-    # backup then atomic write
-    if master_file.exists():
-        backup = master_file.with_name(master_file.stem + ".backup" + master_file.suffix)
-        master_file.replace(backup)
-        # after backup, write new
-        safe_write_csv(combined, str(master_file))
-    else:
-        safe_write_csv(combined, str(master_file))
+    # Write new first, then move current to backup, then swap in the new file.
+    # This reduces the chance of losing the primary master filename if a write fails.
+    safe_replace_with_backup(combined, str(master_file))
 
     return combined
 
@@ -374,7 +457,9 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
     Heuristic: same MerchantKey, opposite sign, same abs(amount) within tolerance, within N days.
     We mark both rows and assign a shared ReversalGroupId.
     """
-    out = df.copy()
+    # Reset to a clean RangeIndex and use a dedicated row-position column for updates.
+    # This avoids any dependency on the caller's index labels.
+    out = df.copy().reset_index(drop=True)
     out["IsReversal"] = False
     out["ReversalGroupId"] = ""
     out["ReversalPairWithRefNo"] = ""
@@ -384,11 +469,11 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
         return out
 
     # Work on indexed frame.
-    work = out.reset_index(drop=False).rename(columns={"index": "_row_index"})
+    work = out.reset_index(drop=False).rename(columns={"index": "_row_pos"})
     work["_abs_amount"] = work["Amount"].abs()
 
     # Sort to make pairing deterministic.
-    work = work.sort_values(["MerchantKey", "_abs_amount", "Date", "_row_index"]).reset_index(drop=True)
+    work = work.sort_values(["MerchantKey", "_abs_amount", "Date", "_row_pos"]).reset_index(drop=True)
     used = set()
 
     # Pre-group by MerchantKey for speed.
@@ -399,12 +484,12 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
         # brute-force within group; groups are usually small
         for i in range(len(rows)):
             a = rows[i]
-            ai = a["_row_index"]
+            ai = a["_row_pos"]
             if ai in used:
                 continue
             for j in range(i + 1, len(rows)):
                 b = rows[j]
-                bi = b["_row_index"]
+                bi = b["_row_pos"]
                 if bi in used:
                     continue
                 # Opposite sign
@@ -442,7 +527,8 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
 
 def create_summary(df: pd.DataFrame) -> pd.DataFrame:
     # For spending summary, use absolute outflow values only and exclude likely reversals.
-    spend = df[(df["Amount"] < 0) & (~df.get("IsReversal", False))].copy()
+    is_rev = df.get("IsReversal", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    spend = df[(df["Amount"] < 0) & (~is_rev)].copy()
     spend["Expense"] = spend["Amount"].abs()
 
     summary = (
@@ -460,9 +546,8 @@ def save_outputs(categorized: pd.DataFrame, summary: pd.DataFrame, output_path: 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         categorized.to_excel(writer, index=False, sheet_name="transactions")
         categorized[categorized["NeedsReview"]].to_excel(writer, index=False, sheet_name="review_queue")
-        categorized[categorized.get("IsReversal", False)].to_excel(
-            writer, index=False, sheet_name="reversal_candidates"
-        )
+        is_rev = categorized.get("IsReversal", pd.Series(False, index=categorized.index)).fillna(False).astype(bool)
+        categorized[is_rev].to_excel(writer, index=False, sheet_name="reversal_candidates")
 
         # Lightweight QA report
         qa = {
@@ -519,7 +604,8 @@ def main():
         raise ValueError("No transactions found after parsing.")
 
     rules = load_mapping(args.mapping)
-    categorized = categorize_with_mapping(tx_master, rules)
+    enriched = enrich_master_ledger(tx_master)
+    categorized = categorize_with_mapping(enriched, rules)
     categorized = detect_reversal_pairs(categorized)
     summary = create_summary(categorized)
     save_outputs(categorized, summary, args.output, args.summary)
