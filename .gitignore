@@ -14,6 +14,7 @@ expense_venv/
 .env
 
 # Sensitive + generated data
+expenses/db/*
 expenses/data/raw/
 expenses/data/processed/
 investments/raw/
