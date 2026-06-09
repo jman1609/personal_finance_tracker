@@ -4,7 +4,7 @@
 Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS/XLSX), auto-categorizes transactions, and produces clean outputs for analysis.
 
 ## Current Direction
-- Current implementation: **mapping-first** categorization using a persistent editable mapping file (`config/category_mapping.json`).
+- Current implementation: **mapping-first** categorization using a persistent editable mapping file (`expenses/config/category_mapping.json`).
 - Upcoming: an optional **OpenAI-assisted** pass for uncategorized rows.
 
 ## Expected Inputs
@@ -31,18 +31,19 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 - Review queue for low-confidence or uncategorized rows
 
 ## Repo Conventions
-- Code in `src/`
-- Config in `config/`
-- Sensitive raw files in `data/raw/` (gitignored)
-- Generated files in `data/processed/` (gitignored)
+- Expense code in `expenses/src/`
+- Expense config in `expenses/config/`
+- Expense / credit-card raw files in `expenses/data/raw/`
+- Investment holdings, mutual fund, and stock files in `investments/`
+- Generated files in `expenses/data/processed/` (gitignored)
 - API key in `.env` (gitignored)
 
 ## Current script status
-- `src/categorize_expenses.py` exists and currently supports:
+- `expenses/src/categorize_expenses.py` exists and currently supports:
   - HDFC-style parsing (table detection + footer filtering)
   - Statement metadata extraction: `AccountHolderRaw`, `AccountNumber`, `AccountLast4`, `DownloadedOn`, `SourceFile`
-  - Multi-file ingestion from `data/raw/` and cumulative de-duped master ledger
-  - Mapping-first categorization via `config/category_mapping.json`
+  - Multi-file ingestion from `expenses/data/raw/` and cumulative de-duped master ledger
+  - Mapping-first categorization via `expenses/config/category_mapping.json`
   - Basic narration-derived fields: `PaymentMode`, `CounterpartyGuess`, `UPIHandle`, `TxnIdGuess`
   - Review/QA fields: `Flow` (inflow/outflow/neutral), `NeedsReview` + `ReviewReason`
   - Reversal tagging (heuristic): `Tag=REVERSAL_CANDIDATE`, `ReversalGroupId` (paired transactions)
@@ -56,10 +57,10 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 
 ## Validation loop
 - First run will likely have low coverage until mappings grow.
-- Use `qa_summary` (coverage %) + `review_queue` (rows needing mapping) to iteratively expand `config/category_mapping.json` and re-run.
+- Use `qa_summary` (coverage %) + `review_queue` (rows needing mapping) to iteratively expand `expenses/config/category_mapping.json` and re-run.
 
 ## Master ledger / de-dupe
-- Each run can ingest all files in `data/raw/` and update a cumulative master ledger (gitignored): `data/processed/master_ledger.csv`.
+- Each run can ingest all files in `expenses/data/raw/` and update a cumulative master ledger (gitignored): `expenses/data/processed/master_ledger.csv`.
 - De-dupe strategy (implemented):
   - A stable key built from: `AccountLast4`, `Date`, `Narration`, `RefNo`, `WithdrawalAmt`, `DepositAmt`, `ClosingBalance`
   - Statement metadata like `SourceFile` / `DownloadedOn` is intentionally excluded so re-downloading the same statement doesn't create duplicates.
@@ -72,7 +73,7 @@ Never commit:
 - local virtual environments
 
 ## Near-term Tasks
-1. Add `src/categorize_expenses.py`
+1. Maintain `expenses/src/categorize_expenses.py`
 2. Support mapping-first + optional AI pass
 3. Write outputs and summary files
 4. Test script on sample file

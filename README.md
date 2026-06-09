@@ -6,10 +6,11 @@ This project reads bank/credit-card transactions from **XLS/XLSX** statements, n
 
 ## Safe project structure
 
-- `src/categorize_expenses.py` — main script
-- `config/category_mapping.json` — editable keyword map
-- `data/raw/` — private statements (**gitignored**)
-- `data/processed/` — generated outputs (**gitignored**)
+- `expenses/src/categorize_expenses.py` — expense categorization script
+- `expenses/config/category_mapping.json` — editable expense keyword map
+- `expenses/data/raw/` — private expense / credit-card statements
+- `investments/` — investment holdings, mutual fund, and stock files
+- `expenses/data/processed/` — generated outputs (**gitignored**)
 - `.env` — API key (**gitignored**)
 
 ## Setup
@@ -26,23 +27,23 @@ cp .env.example .env
 ## Run
 
 ```bash
-python src/categorize_expenses.py \
+python expenses/src/categorize_expenses.py \
   --input "/absolute/path/to/statement.xlsx" \
   --sheet "Sheet 1" \
-  --output "data/processed/categorized_transactions.xlsx" \
-  --summary "data/processed/category_summary.xlsx"
+  --output "expenses/data/processed/categorized_transactions.xlsx" \
+  --summary "expenses/data/processed/category_summary.xlsx"
 ```
 
 ### Run on a folder (recommended)
 
-This will ingest all matching statement files in `data/raw/`, update a local cumulative
+This will ingest all matching statement files in `expenses/data/raw/`, update a local cumulative
 master ledger (gitignored), de-dupe, and rebuild outputs from the master ledger.
 
 ```bash
-./.venv/bin/python src/categorize_expenses.py \
-  --input-dir data/raw \
+./.venv/bin/python expenses/src/categorize_expenses.py \
+  --input-dir expenses/data/raw \
   --sheet "Sheet 1" \
-  --master-ledger data/processed/master_ledger.csv
+  --master-ledger expenses/data/processed/master_ledger.csv
 ```
 
 ### Run without AI (mapping only)

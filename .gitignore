@@ -14,8 +14,18 @@ expense_venv/
 .env
 
 # Sensitive + generated data
+expenses/data/raw/
+expenses/data/processed/
+investments/raw/
+investments/*
+!investments/.gitkeep
+!investments/raw/
+investments/raw/*
+!investments/raw/.gitkeep
+
+# Legacy paths, kept in case old data folders are recreated
 data/raw/
 data/processed/
 
 # Optional sample data is safe to commit only if anonymized
-# data/samples/
+# expenses/data/samples/

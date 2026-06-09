@@ -17,7 +17,7 @@ HEADER_KEYWORDS = [
     "closing balance",
 ]
 
-DEFAULT_MASTER_LEDGER_PATH = "data/processed/master_ledger.csv"
+DEFAULT_MASTER_LEDGER_PATH = "expenses/data/processed/master_ledger.csv"
 
 # Master ledger should contain only raw transaction-table columns + account metadata.
 MASTER_LEDGER_COLUMNS = [
@@ -573,12 +573,12 @@ def main():
     parser.add_argument("--input", required=False, help="Path to a single input statement (.xls/.xlsx)")
     parser.add_argument("--input-dir", default=None, help="Directory containing downloaded statements (default: none)")
     parser.add_argument("--sheet", default="Sheet 1", help="Excel sheet name (default: Sheet 1)")
-    parser.add_argument("--mapping", default="config/category_mapping.json", help="Mapping JSON file path")
+    parser.add_argument("--mapping", default="expenses/config/category_mapping.json", help="Mapping JSON file path")
     parser.add_argument("--master-ledger", default=DEFAULT_MASTER_LEDGER_PATH, help="Cumulative master ledger path")
     parser.add_argument(
-        "--output", default="data/processed/categorized_transactions.xlsx", help="Output workbook path"
+        "--output", default="expenses/data/processed/categorized_transactions.xlsx", help="Output workbook path"
     )
-    parser.add_argument("--summary", default="data/processed/category_summary.xlsx", help="Summary output path")
+    parser.add_argument("--summary", default="expenses/data/processed/category_summary.xlsx", help="Summary output path")
     args = parser.parse_args()
 
     input_files = list_input_files(args.input, args.input_dir)
