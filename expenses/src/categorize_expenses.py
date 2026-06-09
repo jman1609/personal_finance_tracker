@@ -1,15 +1,26 @@
 import argparse
+import hashlib
 import json
 import re
 import uuid
-from datetime import date, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Tuple
 
 import pandas as pd
 
 
-HEADER_KEYWORDS = [
+# --- Hardcoded internal paths ---
+MAPPING_PATH = "expenses/config/category_mapping.json"
+MASTER_LEDGER_PATH = "expenses/db/master_ledger.csv"
+UPLOADED_FILES_PATH = "expenses/db/uploaded_files.csv"
+INGESTION_RUNS_PATH = "expenses/db/ingestion_runs.csv"
+ENRICHED_LEDGER_PATH = "expenses/db/enriched_ledger.csv"
+OUTPUT_PATH = "expenses/data/processed/categorized_transactions.xlsx"
+SUMMARY_PATH = "expenses/data/processed/category_summary.xlsx"
+
+# --- HDFC-specific parser constants ---
+HDFC_HEADER_KEYWORDS = [
     "date",
     "narration",
     "withdrawal amt.",
@@ -17,34 +28,96 @@ HEADER_KEYWORDS = [
     "closing balance",
 ]
 
-DEFAULT_MASTER_LEDGER_PATH = "expenses/data/processed/master_ledger.csv"
-
-# Master ledger should contain only raw transaction-table columns + account metadata.
+# --- Canonical schemas ---
 MASTER_LEDGER_COLUMNS = [
-    "AccountHolderRaw",
-    "AccountNumber",
-    "AccountLast4",
-    "DownloadedOn",
-    "SourceFile",
+    "TransactionId",
+    "SourceFileId",
     "Date",
-    "Narration",
-    "RefNo",
-    "WithdrawalAmt",
-    "DepositAmt",
-    "ClosingBalance",
+    "PostedDate",
+    "DescriptionRaw",
+    "DescriptionNormalized",
+    "ReferenceNumber",
+    "WithdrawalAmount",
+    "DepositAmount",
+    "SignedAmount",
+    "TransactionFingerprint",
+    "CreatedAt",
+    "UpdatedAt",
 ]
 
-# De-dupe should exclude SourceFile/DownloadedOn (they differ across downloads).
-DEDUPE_KEY_COLUMNS = [
-    "AccountLast4",
-    "Date",
-    "Narration",
-    "RefNo",
-    "WithdrawalAmt",
-    "DepositAmt",
-    "ClosingBalance",
+UPLOADED_FILES_COLUMNS = [
+    "SourceFileId",
+    "OriginalFileName",
+    "StoredFilePath",
+    "FileHash",
+    "SourceType",
+    "Institution",
+    "AccountOrCardLast4",
+    "StatementPeriodStart",
+    "StatementPeriodEnd",
+    "TotalTransactionsInFile",
+    "UploadedAt",
+    "ParsedStatus",
+    "ValidationStatus",
 ]
 
+INGESTION_RUNS_COLUMNS = [
+    "RunId",
+    "SourceFileId",
+    "RowsParsed",
+    "RowsAdded",
+    "RowsSkippedAsDuplicates",
+    "RowsFailedValidation",
+    "StartedAt",
+    "CompletedAt",
+    "Status",
+]
+
+ENRICHED_LEDGER_COLUMNS = [
+    # Core transaction data (from master_ledger)
+    "TransactionId",
+    "SourceFileId",
+    "Date",
+    "PostedDate",
+    "DescriptionRaw",
+    "DescriptionNormalized",
+    "ReferenceNumber",
+    "WithdrawalAmount",
+    "DepositAmount",
+    "SignedAmount",
+    "TransactionFingerprint",
+    "CreatedAt",
+    "UpdatedAt",
+    # File metadata (from uploaded_files)
+    "SourceType",
+    "Institution",
+    "AccountOrCardLast4",
+    "StatementPeriodStart",
+    "StatementPeriodEnd",
+    "SourceFileName",
+    # Derived transaction attributes
+    "Flow",
+    "PaymentMode",
+    "CounterpartyGuess",
+    "UPIHandle",
+    "TxnIdGuess",
+    # Categorization
+    "Category",
+    "Subcategory",
+    "Merchant",
+    "CategorizationConfidence",
+    "MatchedPattern",
+    "NeedsReview",
+    "ReviewReason",
+    # Reversal tracking
+    "IsReversal",
+    "ReversalGroupId",
+]
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def normalize_account_last4(value: str) -> str:
     s = "" if value is None else str(value).strip()
@@ -52,195 +125,396 @@ def normalize_account_last4(value: str) -> str:
     return digits.zfill(4)[-4:] if digits else ""
 
 
-def find_header_row(df: pd.DataFrame) -> int:
-    for idx, row in df.iterrows():
-        line = " | ".join([str(v).strip().lower() for v in row.tolist() if pd.notna(v)])
-        if all(k in line for k in HEADER_KEYWORDS):
-            return idx
-    raise ValueError("Could not find transaction header row in statement.")
+def normalize_description(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def extract_statement_metadata(raw: pd.DataFrame, header_row: int, source_path: str) -> Dict[str, str]:
-    """Extract account metadata from rows above the transaction header.
-
-    Works for the HDFC export format where account details appear in the first ~20 rows.
-    """
-    header_block = raw.iloc[:header_row].astype(str)
-    flat_text = "\n".join(
-        " ".join([c for c in row.tolist() if c and c != "nan"]) for _, row in header_block.iterrows()
-    )
-
-    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
-    account_no = account_no_match.group(1) if account_no_match else ""
-    last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
-
-    # Holder name: take the first non-empty cell that looks like a name line.
-    # We keep it exactly as in the file (no normalization), per user preference.
-    holder_raw = ""
-    for _, row in header_block.iterrows():
-        for cell in row.tolist():
-            if not cell or cell == "nan":
-                continue
-            s = str(cell).strip()
-            # heuristic: contains letters and at least one space, but not a label with ':'
-            if ":" in s:
-                continue
-            if re.search(r"[A-Za-z]", s) and len(s) >= 6 and (" " in s):
-                holder_raw = s
-                break
-        if holder_raw:
-            break
-
-    downloaded_on = extract_download_date_from_filename(Path(source_path).name) or ""
-
-    return {
-        "AccountHolderRaw": holder_raw,
-        "AccountNumber": account_no,
-        "AccountLast4": last4,
-        "DownloadedOn": downloaded_on,
-        "SourceFile": Path(source_path).name,
-    }
+def compute_file_hash(file_path: str) -> str:
+    """SHA-256 hash of file contents."""
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
-def extract_download_date_from_filename(filename: str) -> str:
-    """Extract download date from filenames like `..._08032026.xls` -> 2026-03-08.
+def compute_transaction_fingerprint(
+    institution: str,
+    account_last4: str,
+    date_str: str,
+    description_normalized: str,
+    reference_number: str,
+    signed_amount: float,
+    closing_balance: str,
+) -> str:
+    """SHA-256 fingerprint for stable cross-run de-duplication."""
+    parts = "|".join([
+        institution.upper().strip(),
+        account_last4,
+        date_str,
+        description_normalized.upper(),
+        reference_number,
+        f"{signed_amount:.4f}",
+        closing_balance,
+    ])
+    return hashlib.sha256(parts.encode()).hexdigest()[:24]
 
-    Returns ISO date string (YYYY-MM-DD) or empty string.
-    """
-    m = re.search(r"_(\d{2})(\d{2})(\d{4})\.(xls|xlsx)$", filename, flags=re.IGNORECASE)
-    if not m:
-        return ""
-    dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
-    dt = pd.to_datetime(f"{dd}/{mm}/{yyyy}", dayfirst=True, errors="coerce")
-    return dt.date().isoformat() if pd.notna(dt) else ""
 
+# ---------------------------------------------------------------------------
+# Date parsing
+# ---------------------------------------------------------------------------
 
 def looks_like_date(value) -> bool:
-    """Return True if a value can reasonably be interpreted as a date.
-
-    Note: bank exports sometimes contain actual datetime objects OR Excel serials.
-    This function is intentionally permissive to avoid dropping valid transaction rows.
-    """
     if pd.isna(value):
         return False
-
-    # Already date-like
-    if isinstance(value, (pd.Timestamp, datetime, date)):
+    if isinstance(value, (pd.Timestamp, datetime)):
         return True
-
-    # Excel serial dates can come through as numbers
     if isinstance(value, (int, float)):
-        dt = pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce")
-        return pd.notna(dt)
-
-    # General string parse (dayfirst handles dd/mm/yy and dd-mm-yyyy cases)
-    s = str(value).strip()
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    return pd.notna(dt)
+        return pd.notna(pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce"))
+    return pd.notna(pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True))
 
 
 def parse_date_series(values: pd.Series) -> pd.Series:
-    """Parse a statement Date column into pandas datetime.
-
-    Handles:
-      - Timestamp/date/datetime objects
-      - Excel serial dates (numbers)
-      - Common string formats (dayfirst)
-
-    Returns a datetime64[ns] series (NaT where unparseable).
-    """
+    """Parse mixed-type date column into datetime64[ns]."""
     if values is None:
         return pd.Series(dtype="datetime64[ns]")
 
     s = values.copy()
-
-    # 1) Excel serials / numeric values
     is_num = s.apply(lambda x: isinstance(x, (int, float)) and not pd.isna(x))
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
     if is_num.any():
         out.loc[is_num] = pd.to_datetime(
             s.loc[is_num].astype(float), unit="D", origin="1899-12-30", errors="coerce"
         )
-
-    # 2) Everything else: let pandas parse strings/datetimes
-    rest = ~is_num
-    if rest.any():
-        # Avoid turning NaN into "nan" strings
-        rest_vals = s.loc[rest]
-        rest_dt = pd.to_datetime(rest_vals, errors="coerce", dayfirst=True)
-        out.loc[rest] = rest_dt
+    if (~is_num).any():
+        out.loc[~is_num] = pd.to_datetime(s.loc[~is_num], errors="coerce", dayfirst=True)
 
     return out
 
 
-def parse_statement(input_path: str, sheet_name: str = "Sheet 1") -> pd.DataFrame:
-    raw = pd.read_excel(input_path, sheet_name=sheet_name, header=None)
+# ---------------------------------------------------------------------------
+# HDFC statement parsing
+# ---------------------------------------------------------------------------
+
+def find_header_row(df: pd.DataFrame) -> int:
+    for idx, row in df.iterrows():
+        line = " | ".join([str(v).strip().lower() for v in row.tolist() if pd.notna(v)])
+        if all(k in line for k in HDFC_HEADER_KEYWORDS):
+            return idx
+    raise ValueError("Could not find transaction header row in statement.")
+
+
+def extract_statement_metadata(raw: pd.DataFrame, header_row: int, tx_df: pd.DataFrame, institution: str) -> Dict[str, str]:
+    """Extract HDFC statement metadata from parsed transactions and header.
+
+    Returns metadata for uploaded_files.csv row.
+    """
+    # Extract AccountLast4 from header
+    header_block = raw.iloc[:header_row].astype(str)
+    flat_text = "\n".join(
+        " ".join([c for c in row.tolist() if c and c != "nan"])
+        for _, row in header_block.iterrows()
+    )
+    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
+    account_no = account_no_match.group(1) if account_no_match else ""
+    last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
+
+    # Extract period from transaction dates
+    if not tx_df.empty and "Date" in tx_df.columns:
+        dates = pd.to_datetime(tx_df["Date"], errors="coerce")
+        valid_dates = dates[dates.notna()].sort_values()
+        period_start = valid_dates.iloc[0].date().isoformat() if len(valid_dates) > 0 else ""
+        period_end = valid_dates.iloc[-1].date().isoformat() if len(valid_dates) > 0 else ""
+    else:
+        period_start = period_end = ""
+
+    return {
+        "AccountOrCardLast4": last4,
+        "StatementPeriodStart": period_start,
+        "StatementPeriodEnd": period_end,
+        "TotalTransactionsInFile": len(tx_df),
+    }
+
+
+def parse_statement(
+    input_path: str,
+    source_file_id: str,
+    institution: str,
+    source_type: str,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Parse an HDFC bank statement and return (transactions_df, statement_metadata).
+
+    Transactions are in canonical master_ledger schema.
+    Metadata is for uploaded_files.csv row.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    raw = pd.read_excel(input_path, sheet_name=0, header=None)
     header_row = find_header_row(raw)
-    meta = extract_statement_metadata(raw, header_row, input_path)
 
-    tx = raw.iloc[header_row + 2 :].copy()  # skip separator row of *****
+    tx = raw.iloc[header_row + 2:].copy()  # +2 skips the ***** separator row
     tx = tx.iloc[:, :7]
-    tx.columns = [
-        "Date",
-        "Narration",
-        "RefNo",
-        "ValueDate",
-        "WithdrawalAmt",
-        "DepositAmt",
-        "ClosingBalance",
-    ]
-
-    # Keep rows where first column resembles a date in any common format.
+    tx.columns = ["Date", "Narration", "RefNo", "ValueDate", "WithdrawalAmt", "DepositAmt", "ClosingBalance"]
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
 
-    # Keep only one date column in master ledger.
-    tx = tx.drop(columns=["ValueDate"])
-
-    # Normalize types for master ledger storage:
-    #   - Date: keep as datetime64[ns] (stable, easy enrichment later)
-    #   - Everything else: keep as strings
     tx["Date"] = parse_date_series(tx["Date"])
-
-    tx["Narration"] = tx["Narration"].apply(
-        lambda x: "" if pd.isna(x) else re.sub(r"\s+", " ", str(x).strip())
-    )
-    # Keep RefNo as raw-ish string (do not normalize to int), to match manual de-dupe.
+    tx["Narration"] = tx["Narration"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
     tx["RefNo"] = tx["RefNo"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
 
-    # Amount columns: keep as strings (strip, remove commas)
     for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
-        s = tx[col].apply(lambda x: "" if pd.isna(x) else str(x).strip())
-        tx[col] = s.str.replace(",", "", regex=False)
+        tx[col] = tx[col].apply(lambda x: "" if pd.isna(x) else str(x).strip()).str.replace(",", "", regex=False)
 
-    # Attach statement-level metadata to every transaction row
-    for k, v in meta.items():
-        tx[k] = v
+    tx["WithdrawalAmount"] = pd.to_numeric(tx["WithdrawalAmt"], errors="coerce").fillna(0.0)
+    tx["DepositAmount"] = pd.to_numeric(tx["DepositAmt"], errors="coerce").fillna(0.0)
+    tx["SignedAmount"] = tx["DepositAmount"] - tx["WithdrawalAmount"]
 
-    tx["AccountLast4"] = tx.get("AccountLast4", "").apply(normalize_account_last4)
+    tx["DescriptionRaw"] = tx["Narration"]
+    tx["DescriptionNormalized"] = tx["Narration"].apply(normalize_description)
 
-    # Keep only master-ledger columns
-    return tx[MASTER_LEDGER_COLUMNS].copy()
+    # Extract AccountLast4 for fingerprinting
+    header_block = raw.iloc[:header_row].astype(str)
+    flat_text = "\n".join(
+        " ".join([c for c in row.tolist() if c and c != "nan"])
+        for _, row in header_block.iterrows()
+    )
+    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
+    account_no = account_no_match.group(1) if account_no_match else ""
+    account_last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
 
+    def make_fingerprint(row):
+        date_str = row["Date"].date().isoformat() if pd.notna(row["Date"]) else ""
+        return compute_transaction_fingerprint(
+            institution=institution,
+            account_last4=account_last4,
+            date_str=date_str,
+            description_normalized=row["DescriptionNormalized"],
+            reference_number=row["RefNo"],
+            signed_amount=row["SignedAmount"],
+            closing_balance=row["ClosingBalance"],
+        )
+
+    tx["TransactionFingerprint"] = tx.apply(make_fingerprint, axis=1)
+    tx["TransactionId"] = [str(uuid.uuid4()) for _ in range(len(tx))]
+    tx["SourceFileId"] = source_file_id
+    tx["PostedDate"] = ""
+    tx["ReferenceNumber"] = tx["RefNo"]
+    tx["CreatedAt"] = now
+    tx["UpdatedAt"] = now
+
+    result_tx = tx[MASTER_LEDGER_COLUMNS].copy()
+
+    # Extract statement metadata
+    meta = extract_statement_metadata(raw, header_row, result_tx, institution)
+    return result_tx, meta
+
+
+# ---------------------------------------------------------------------------
+# Master ledger management
+# ---------------------------------------------------------------------------
+
+def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
+    """Write CSV safely: write .tmp → backup existing → swap in new file."""
+    out = Path(final_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    if out.exists():
+        backup = out.with_name(out.stem + ".backup" + out.suffix)
+        out.replace(backup)
+    tmp.replace(out)
+
+
+def update_master_ledger(
+    master_path: str, new_rows: pd.DataFrame
+) -> Tuple[pd.DataFrame, int, int]:
+    """Merge new_rows into master ledger using TransactionFingerprint for de-dupe.
+
+    Returns (updated_df, rows_added, rows_skipped).
+    """
+    master_file = Path(master_path)
+    master_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if master_file.exists() and master_file.stat().st_size > 0:
+        existing = pd.read_csv(master_file, dtype=str).fillna("")
+        if "Date" in existing.columns:
+            existing["Date"] = parse_date_series(existing["Date"])
+    else:
+        existing = pd.DataFrame(columns=MASTER_LEDGER_COLUMNS)
+
+    existing_fingerprints = set(existing["TransactionFingerprint"].tolist()) if not existing.empty else set()
+    is_new = ~new_rows["TransactionFingerprint"].isin(existing_fingerprints)
+    rows_added = int(is_new.sum())
+    rows_skipped = int((~is_new).sum())
+
+    combined = pd.concat([existing, new_rows[is_new]], ignore_index=True)
+    keep_cols = [c for c in MASTER_LEDGER_COLUMNS if c in combined.columns]
+    combined = combined[keep_cols].reset_index(drop=True)
+
+    safe_replace_with_backup(combined, str(master_file))
+    return combined, rows_added, rows_skipped
+
+
+# ---------------------------------------------------------------------------
+# Ingestion tracking (uploaded_files.csv and ingestion_runs.csv)
+# ---------------------------------------------------------------------------
+
+def append_uploaded_file_row(
+    source_file_id: str,
+    original_filename: str,
+    input_path: str,
+    source_type: str,
+    institution: str,
+    statement_metadata: Dict[str, str],
+) -> None:
+    """Append one row to uploaded_files.csv."""
+    file_hash = compute_file_hash(input_path)
+    now = datetime.now(timezone.utc).isoformat()
+
+    row_data = {
+        "SourceFileId": source_file_id,
+        "OriginalFileName": original_filename,
+        "StoredFilePath": input_path,
+        "FileHash": file_hash,
+        "SourceType": source_type,
+        "Institution": institution,
+        "AccountOrCardLast4": statement_metadata.get("AccountOrCardLast4", ""),
+        "StatementPeriodStart": statement_metadata.get("StatementPeriodStart", ""),
+        "StatementPeriodEnd": statement_metadata.get("StatementPeriodEnd", ""),
+        "TotalTransactionsInFile": statement_metadata.get("TotalTransactionsInFile", 0),
+        "UploadedAt": now,
+        "ParsedStatus": "PARSED",
+        "ValidationStatus": "PENDING",
+    }
+
+    row_df = pd.DataFrame([row_data])
+    row_df = row_df.astype(str).fillna("")
+
+    out_file = Path(UPLOADED_FILES_PATH)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_file.exists() and out_file.stat().st_size > 0:
+        existing = pd.read_csv(out_file, dtype=str).fillna("")
+        combined = pd.concat([existing, row_df], ignore_index=True)
+    else:
+        combined = row_df
+
+    combined = combined[UPLOADED_FILES_COLUMNS]
+    safe_replace_with_backup(combined, str(out_file))
+
+
+def append_ingestion_run_row(
+    run_id: str,
+    source_file_id: str,
+    rows_parsed: int,
+    rows_added: int,
+    rows_skipped: int,
+) -> None:
+    """Append one row to ingestion_runs.csv."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    row_data = {
+        "RunId": run_id,
+        "SourceFileId": source_file_id,
+        "RowsParsed": rows_parsed,
+        "RowsAdded": rows_added,
+        "RowsSkippedAsDuplicates": rows_skipped,
+        "RowsFailedValidation": 0,
+        "StartedAt": now,
+        "CompletedAt": now,
+        "Status": "SUCCESS",
+    }
+
+    row_df = pd.DataFrame([row_data])
+    row_df = row_df.astype(str).fillna("")
+
+    out_file = Path(INGESTION_RUNS_PATH)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_file.exists() and out_file.stat().st_size > 0:
+        existing = pd.read_csv(out_file, dtype=str).fillna("")
+        combined = pd.concat([existing, row_df], ignore_index=True)
+    else:
+        combined = row_df
+
+    combined = combined[INGESTION_RUNS_COLUMNS]
+    safe_replace_with_backup(combined, str(out_file))
+
+
+def compute_categorization_confidence(row: pd.Series) -> str:
+    """Determine confidence level based on categorization signals."""
+    if row.get("Category") == "Uncategorized":
+        return "NONE"
+    if row.get("NeedsReview"):
+        return "LOW"
+    if row.get("MatchedPattern"):
+        return "HIGH"
+    return "MEDIUM"
+
+
+def write_enriched_ledger(
+    categorized_df: pd.DataFrame,
+    source_file_id: str,
+    source_type: str,
+    institution: str,
+    original_filename: str,
+    statement_metadata: Dict[str, str],
+) -> None:
+    """Write categorized transactions to enriched_ledger.csv.
+
+    Enriched ledger is a denormalized view combining master_ledger + file metadata + categorization.
+    """
+    out = categorized_df.copy()
+
+    # Add metadata columns
+    out["SourceType"] = source_type
+    out["Institution"] = institution
+    out["AccountOrCardLast4"] = statement_metadata.get("AccountOrCardLast4", "")
+    out["StatementPeriodStart"] = statement_metadata.get("StatementPeriodStart", "")
+    out["StatementPeriodEnd"] = statement_metadata.get("StatementPeriodEnd", "")
+    out["SourceFileName"] = original_filename
+
+    # Add confidence signal
+    out["CategorizationConfidence"] = out.apply(compute_categorization_confidence, axis=1)
+
+    # Keep only enriched_ledger schema columns
+    out = out[[c for c in ENRICHED_LEDGER_COLUMNS if c in out.columns]]
+    out = out.astype(str).fillna("")
+
+    # Append to enriched_ledger.csv
+    out_file = Path(ENRICHED_LEDGER_PATH)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_file.exists() and out_file.stat().st_size > 0:
+        existing = pd.read_csv(out_file, dtype=str).fillna("")
+        combined = pd.concat([existing, out], ignore_index=True)
+    else:
+        combined = out
+
+    # De-dupe on TransactionId and keep latest
+    if "TransactionId" in combined.columns:
+        combined = combined.drop_duplicates(subset=["TransactionId"], keep="last").reset_index(drop=True)
+
+    combined = combined[[c for c in ENRICHED_LEDGER_COLUMNS if c in combined.columns]]
+    safe_replace_with_backup(combined, str(out_file))
+
+
+# ---------------------------------------------------------------------------
+# Enrichment (derives reporting fields from master_ledger data)
+# ---------------------------------------------------------------------------
 
 def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
-    """Add derived fields used for categorization + reporting.
-
-    Master ledger is kept minimal (raw columns + metadata). This function builds
-    the enriched view used for categorization outputs.
-    """
+    """Add derived fields for categorization and reporting."""
     df = master_df.copy()
 
-    # Master ledger Date should be datetime, but may come back from CSV as strings.
     if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
         df["Date"] = parse_date_series(df["Date"])
-    for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
+
+    for col in ["WithdrawalAmount", "DepositAmount", "SignedAmount"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    df["Narration"] = df["Narration"].astype(str).str.strip()
 
-    df["Amount"] = df["DepositAmt"] - df["WithdrawalAmt"]
-    df["Flow"] = df["Amount"].apply(lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL"))
+    df["Flow"] = df["SignedAmount"].apply(
+        lambda x: "INFLOW" if x > 0 else ("OUTFLOW" if x < 0 else "NEUTRAL")
+    )
 
-    derived = df["Narration"].apply(extract_narration_features).apply(pd.Series)
+    derived = df["DescriptionNormalized"].apply(extract_narration_features).apply(pd.Series)
     df = pd.concat([df, derived], axis=1)
 
     df["Year"] = df["Date"].dt.year
@@ -249,155 +523,33 @@ def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def list_input_files(input_path: Optional[str], input_dir: Optional[str]) -> List[str]:
-    if input_path:
-        return [input_path]
-    if not input_dir:
-        raise ValueError("Provide either --input or --input-dir")
-
-    p = Path(input_dir)
-    if not p.exists():
-        raise ValueError(f"Input dir does not exist: {input_dir}")
-
-    patterns = ["Acct_Statement_*.xls", "Acct_Statement_*.xlsx", "Statement_*.xls", "Statement_*.xlsx"]
-    files: List[Path] = []
-    for pat in patterns:
-        files.extend(list(p.glob(pat)))
-    files = sorted({f.resolve() for f in files})
-    return [str(f) for f in files]
-
-
-def compute_dedupe_key(df: pd.DataFrame) -> pd.Series:
-    """De-dupe key for master ledger.
-
-    User requirement: de-dupe using *transaction identity* columns only (not SourceFile,
-    DownloadedOn, or other statement metadata).
-    """
-    work = df.copy()
-
-    # Ensure all columns exist
-    for c in MASTER_LEDGER_COLUMNS:
-        if c not in work.columns:
-            work[c] = ""
-
-    # Normalize minimal formatting (dedupe-key columns only)
-    work["AccountLast4"] = work["AccountLast4"].apply(normalize_account_last4)
-    # Normalize Date to a stable string for keying.
-    dt = parse_date_series(work["Date"])
-    # If anything comes through tz-aware, make it naive before .date conversion.
-    try:
-        if hasattr(dt.dt, "tz") and dt.dt.tz is not None:
-            dt = dt.dt.tz_localize(None)
-    except Exception:
-        # Best-effort hardening; if tz handling fails, continue with parsed dt.
-        pass
-    work["Date"] = dt.dt.date.astype(str).where(dt.notna(), "")
-    work["Narration"] = work["Narration"].apply(lambda x: "" if pd.isna(x) else re.sub(r"\s+", " ", str(x).strip()))
-    work["RefNo"] = work["RefNo"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
-    for col in ["WithdrawalAmt", "DepositAmt", "ClosingBalance"]:
-        work[col] = work[col].apply(lambda x: "" if pd.isna(x) else str(x).strip())
-
-    return work[DEDUPE_KEY_COLUMNS].astype(str).agg("|".join, axis=1)
-
-
-def safe_write_csv(df: pd.DataFrame, path: str):
-    out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(out.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-    tmp.replace(out)
-
-
-def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
-    """Safely write a CSV and keep a backup of any existing file.
-
-    Order of operations:
-      1) write new content to <final>.tmp
-      2) move existing <final> to <final>.backup
-      3) move <final>.tmp to <final>
-    """
-    out = Path(final_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp = out.with_suffix(out.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-
-    if out.exists():
-        backup = out.with_name(out.stem + ".backup" + out.suffix)
-        out.replace(backup)
-
-    tmp.replace(out)
-
-
-def update_master_ledger(master_path: str, new_rows: pd.DataFrame) -> pd.DataFrame:
-    master_file = Path(master_path)
-    master_file.parent.mkdir(parents=True, exist_ok=True)
-
-    if master_file.exists():
-        # Read as strings to preserve exact raw values as much as possible
-        existing = pd.read_csv(master_file, dtype=str).fillna("")
-        if "AccountLast4" in existing.columns:
-            existing["AccountLast4"] = existing["AccountLast4"].apply(normalize_account_last4)
-        if "Date" in existing.columns:
-            existing["Date"] = parse_date_series(existing["Date"])
-    else:
-        existing = pd.DataFrame()
-
-    new_rows = new_rows.copy()
-    if "AccountLast4" in new_rows.columns:
-        new_rows["AccountLast4"] = new_rows["AccountLast4"].apply(normalize_account_last4)
-    if "Date" in new_rows.columns and not pd.api.types.is_datetime64_any_dtype(new_rows["Date"]):
-        new_rows["Date"] = parse_date_series(new_rows["Date"])
-
-    combined = pd.concat([existing, new_rows], ignore_index=True)
-    # Keep only master-ledger columns in the stored dataset
-    keep_cols = [c for c in MASTER_LEDGER_COLUMNS if c in combined.columns]
-    combined = combined[keep_cols].copy()
-    combined["_DedupeKey"] = compute_dedupe_key(combined)
-    combined = combined.drop_duplicates(subset=["_DedupeKey"], keep="last").drop(columns=["_DedupeKey"]).reset_index(
-        drop=True
-    )
-
-    # Write new first, then move current to backup, then swap in the new file.
-    # This reduces the chance of losing the primary master filename if a write fails.
-    safe_replace_with_backup(combined, str(master_file))
-
-    return combined
-
-
 def extract_narration_features(narration: str) -> dict:
     text = (narration or "").strip()
     parts = [p.strip() for p in text.split("-") if p.strip()]
-
-    mode = parts[0].upper() if parts else "OTHER"
-    counterparty = parts[1] if len(parts) > 1 else ""
-
-    upi_handle_match = re.search(r"([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)", text)
-    txn_id_match = re.search(r"\b(\d{10,20})\b", text)
-
+    upi_match = re.search(r"([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)", text)
+    txn_match = re.search(r"\b(\d{10,20})\b", text)
     return {
-        "PaymentMode": mode,
-        "CounterpartyGuess": counterparty,
-        "UPIHandle": upi_handle_match.group(1) if upi_handle_match else "",
-        "TxnIdGuess": txn_id_match.group(1) if txn_id_match else "",
+        "PaymentMode": parts[0].upper() if parts else "OTHER",
+        "CounterpartyGuess": parts[1] if len(parts) > 1 else "",
+        "UPIHandle": upi_match.group(1) if upi_match else "",
+        "TxnIdGuess": txn_match.group(1) if txn_match else "",
     }
 
 
 def normalize_merchant_key(narration: str) -> str:
-    """Best-effort stable key from narration, used for reversals/refunds pairing."""
-    s = (narration or "").upper()
-    # Remove long numbers/ids to reduce noise.
-    s = re.sub(r"\b\d{4,}\b", " ", s)
-    # Remove common separators and collapse whitespace.
+    """Stable key from narration for reversal pairing (strips ids, numbers)."""
+    s = re.sub(r"\b\d{4,}\b", " ", (narration or "").upper())
     s = re.sub(r"[^A-Z]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:60]
+    return re.sub(r"\s+", " ", s).strip()[:60]
 
+
+# ---------------------------------------------------------------------------
+# Categorization
+# ---------------------------------------------------------------------------
 
 def load_mapping(mapping_path: str) -> list:
     with open(mapping_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    return payload.get("rules", [])
+        return json.load(f).get("rules", [])
 
 
 def categorize_with_mapping(df: pd.DataFrame, rules: list) -> pd.DataFrame:
@@ -409,56 +561,43 @@ def categorize_with_mapping(df: pd.DataFrame, rules: list) -> pd.DataFrame:
     out["NeedsReview"] = False
     out["ReviewReason"] = ""
 
-    narr_upper = out["Narration"].fillna("").str.upper()
-    # If multiple patterns match a single narration, that's a signal to review.
-    patterns = []
-    for rule in rules:
-        pat = str(rule.get("pattern", "")).upper().strip()
-        if pat:
-            patterns.append(pat)
+    narr_upper = out["DescriptionNormalized"].fillna("").str.upper()
+    patterns = [str(r.get("pattern", "")).upper().strip() for r in rules if r.get("pattern")]
 
-    def matched_patterns(narr: str) -> list:
-        n = (narr or "").upper()
-        return [p for p in patterns if p and (p in n)]
-
-    out["AllMatchedPatterns"] = out["Narration"].apply(matched_patterns)
+    out["AllMatchedPatterns"] = out["DescriptionNormalized"].apply(
+        lambda n: [p for p in patterns if p and p in (n or "").upper()]
+    )
     multi_mask = out["AllMatchedPatterns"].apply(lambda xs: len(xs) > 1)
     out.loc[multi_mask, "NeedsReview"] = True
     out.loc[multi_mask, "ReviewReason"] = "MULTIPLE_MATCHES"
 
-    # Apply rules in order for deterministic assignment (first match wins)
     for rule in rules:
         pattern = str(rule.get("pattern", "")).upper().strip()
         if not pattern:
             continue
-        mask = (out["Category"] == "Uncategorized") & narr_upper.str.contains(re.escape(pattern), regex=True)
+        mask = out["Category"].eq("Uncategorized") & narr_upper.str.contains(re.escape(pattern), regex=True)
         out.loc[mask, "Category"] = rule.get("category", "Uncategorized")
         out.loc[mask, "Subcategory"] = rule.get("subcategory", "")
         out.loc[mask, "Merchant"] = rule.get("merchant", "")
         out.loc[mask, "MatchedPattern"] = pattern
 
-    # No match -> review
-    no_match_mask = out["Category"].eq("Uncategorized")
-    out.loc[no_match_mask, "NeedsReview"] = True
-    out.loc[no_match_mask & (out["ReviewReason"] == ""), "ReviewReason"] = "NO_MATCH"
+    no_match = out["Category"].eq("Uncategorized")
+    out.loc[no_match, "NeedsReview"] = True
+    out.loc[no_match & out["ReviewReason"].eq(""), "ReviewReason"] = "NO_MATCH"
 
-    # MerchantKey for reversals pairing (prefer explicit mapping match)
     out["MerchantKey"] = out.apply(
-        lambda r: (str(r.get("MatchedPattern", "")).strip() or normalize_merchant_key(r.get("Narration", ""))),
+        lambda r: str(r.get("MatchedPattern", "")).strip() or normalize_merchant_key(r.get("DescriptionNormalized", "")),
         axis=1,
     )
-
     return out
 
 
-def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_tolerance: float = 1.0) -> pd.DataFrame:
-    """Pair likely reversals/refunds.
+# ---------------------------------------------------------------------------
+# Reversal detection
+# ---------------------------------------------------------------------------
 
-    Heuristic: same MerchantKey, opposite sign, same abs(amount) within tolerance, within N days.
-    We mark both rows and assign a shared ReversalGroupId.
-    """
-    # Reset to a clean RangeIndex and use a dedicated row-position column for updates.
-    # This avoids any dependency on the caller's index labels.
+def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_tolerance: float = 1.0) -> pd.DataFrame:
+    """Pair likely reversal/refund transactions by MerchantKey, opposite sign, within day_window."""
     out = df.copy().reset_index(drop=True)
     out["IsReversal"] = False
     out["ReversalGroupId"] = ""
@@ -468,153 +607,158 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
     if out.empty:
         return out
 
-    # Work on indexed frame.
     work = out.reset_index(drop=False).rename(columns={"index": "_row_pos"})
-    work["_abs_amount"] = work["Amount"].abs()
-
-    # Sort to make pairing deterministic.
+    work["_abs_amount"] = work["SignedAmount"].abs()
     work = work.sort_values(["MerchantKey", "_abs_amount", "Date", "_row_pos"]).reset_index(drop=True)
-    used = set()
+    used: set = set()
 
-    # Pre-group by MerchantKey for speed.
-    for key, g in work.groupby("MerchantKey", sort=False):
-        if g.shape[0] < 2:
+    for _key, g in work.groupby("MerchantKey", sort=False):
+        if len(g) < 2:
             continue
         rows = g.to_dict("records")
-        # brute-force within group; groups are usually small
         for i in range(len(rows)):
             a = rows[i]
-            ai = a["_row_pos"]
-            if ai in used:
+            if a["_row_pos"] in used:
                 continue
             for j in range(i + 1, len(rows)):
                 b = rows[j]
-                bi = b["_row_pos"]
-                if bi in used:
+                if b["_row_pos"] in used:
                     continue
-                # Opposite sign
-                if (a["Amount"] == 0) or (b["Amount"] == 0) or (a["Amount"] > 0) == (b["Amount"] > 0):
+                if (a["SignedAmount"] == 0) or (b["SignedAmount"] == 0):
                     continue
-                # Amount match within tolerance
+                if (a["SignedAmount"] > 0) == (b["SignedAmount"] > 0):
+                    continue
                 if abs(a["_abs_amount"] - b["_abs_amount"]) > amount_tolerance:
                     continue
-                # Date proximity
-                da = a["Date"]
-                db = b["Date"]
-                if pd.isna(da) or pd.isna(db):
-                    continue
-                if abs((da - db).days) > day_window:
+                da, db = a["Date"], b["Date"]
+                if pd.isna(da) or pd.isna(db) or abs((da - db).days) > day_window:
                     continue
 
-                # Pair found
                 gid = str(uuid.uuid4())
-                used.add(ai)
-                used.add(bi)
-                out.loc[ai, "IsReversal"] = True
-                out.loc[bi, "IsReversal"] = True
-                out.loc[ai, "ReversalGroupId"] = gid
-                out.loc[bi, "ReversalGroupId"] = gid
-                out.loc[ai, "ReversalPairWithRefNo"] = str(out.loc[bi, "RefNo"])
-                out.loc[bi, "ReversalPairWithRefNo"] = str(out.loc[ai, "RefNo"])
+                ai, bi = a["_row_pos"], b["_row_pos"]
+                used.update([ai, bi])
+                for pos, other_pos in [(ai, bi), (bi, ai)]:
+                    out.loc[pos, "IsReversal"] = True
+                    out.loc[pos, "ReversalGroupId"] = gid
+                    out.loc[pos, "ReversalPairWithRefNo"] = str(out.loc[other_pos, "ReferenceNumber"])
+                    out.loc[pos, "Tag"] = "REVERSAL_CANDIDATE"
                 break
 
-    # Mark reversal suspected rows for review
     out.loc[out["IsReversal"], "NeedsReview"] = True
-    out.loc[out["IsReversal"] & (out["ReviewReason"] == ""), "ReviewReason"] = "REVERSAL_SUSPECTED"
-    out.loc[out["IsReversal"], "Tag"] = "REVERSAL_CANDIDATE"
+    out.loc[out["IsReversal"] & out["ReviewReason"].eq(""), "ReviewReason"] = "REVERSAL_SUSPECTED"
     return out
 
 
-def create_summary(df: pd.DataFrame) -> pd.DataFrame:
-    # For spending summary, use absolute outflow values only and exclude likely reversals.
-    is_rev = df.get("IsReversal", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    spend = df[(df["Amount"] < 0) & (~is_rev)].copy()
-    spend["Expense"] = spend["Amount"].abs()
+# ---------------------------------------------------------------------------
+# Summary and output
+# ---------------------------------------------------------------------------
 
-    summary = (
+def create_summary(df: pd.DataFrame) -> pd.DataFrame:
+    is_rev = df.get("IsReversal", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    spend = df[(df["SignedAmount"] < 0) & (~is_rev)].copy()
+    spend["Expense"] = spend["SignedAmount"].abs()
+    return (
         spend.groupby(["Month", "Category", "Subcategory"], dropna=False, as_index=False)["Expense"]
         .sum()
         .sort_values(["Month", "Expense"], ascending=[True, False])
     )
-    return summary
 
 
 def save_outputs(categorized: pd.DataFrame, summary: pd.DataFrame, output_path: str, summary_path: str):
-    out_file = Path(output_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         categorized.to_excel(writer, index=False, sheet_name="transactions")
         categorized[categorized["NeedsReview"]].to_excel(writer, index=False, sheet_name="review_queue")
         is_rev = categorized.get("IsReversal", pd.Series(False, index=categorized.index)).fillna(False).astype(bool)
         categorized[is_rev].to_excel(writer, index=False, sheet_name="reversal_candidates")
-
-        # Lightweight QA report
-        qa = {
+        pd.DataFrame({
             "total_rows": [len(categorized)],
             "uncategorized_rows": [int((categorized["Category"] == "Uncategorized").sum())],
             "coverage_pct": [
                 round(100.0 * (1.0 - (categorized["Category"] == "Uncategorized").mean()), 2)
-                if len(categorized)
-                else 0.0
+                if len(categorized) else 0.0
             ],
             "needs_review_rows": [int(categorized["NeedsReview"].sum())],
             "reversal_rows": [int(categorized.get("IsReversal", pd.Series(False)).sum())],
-        }
-        pd.DataFrame(qa).to_excel(writer, index=False, sheet_name="qa_summary")
+        }).to_excel(writer, index=False, sheet_name="qa_summary")
 
-    sum_file = Path(summary_path)
-    sum_file.parent.mkdir(parents=True, exist_ok=True)
+    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
     summary.to_excel(summary_path, index=False)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Categorize bank statement transactions with mapping-first logic.")
-    parser.add_argument("--input", required=False, help="Path to a single input statement (.xls/.xlsx)")
-    parser.add_argument("--input-dir", default=None, help="Directory containing downloaded statements (default: none)")
-    parser.add_argument("--sheet", default="Sheet 1", help="Excel sheet name (default: Sheet 1)")
-    parser.add_argument("--mapping", default="expenses/config/category_mapping.json", help="Mapping JSON file path")
-    parser.add_argument("--master-ledger", default=DEFAULT_MASTER_LEDGER_PATH, help="Cumulative master ledger path")
-    parser.add_argument(
-        "--output", default="expenses/data/processed/categorized_transactions.xlsx", help="Output workbook path"
-    )
-    parser.add_argument("--summary", default="expenses/data/processed/category_summary.xlsx", help="Summary output path")
+    parser = argparse.ArgumentParser(description="Categorize bank statement transactions.")
+    parser.add_argument("--input", required=True, help="Path to a single statement file (.xls/.xlsx)")
+    parser.add_argument("--institution", required=True, help="Institution name (e.g., HDFC, ICICI)")
+    parser.add_argument("--source-type", required=True, help="Source type (e.g., Bank Account, Credit Card)")
     args = parser.parse_args()
 
-    input_files = list_input_files(args.input, args.input_dir)
-    if not input_files:
-        raise ValueError("No input files found. Provide --input or use --input-dir with matching files.")
+    source_file_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    original_filename = Path(args.input).name
 
-    # Parse all input statements into a single dataframe
-    parsed = [parse_statement(p, args.sheet) for p in input_files]
-    tx_new = pd.concat(parsed, ignore_index=True) if parsed else pd.DataFrame()
+    print(f"Parsing: {args.input}")
+    tx_new, statement_meta = parse_statement(args.input, source_file_id, args.institution, args.source_type)
+    rows_parsed = len(tx_new)
+    print(f"Parsed rows: {rows_parsed}")
 
-    # Update master ledger (dedupe across runs) then rebuild outputs from it
-    tx_master = update_master_ledger(args.master_ledger, tx_new) if not tx_new.empty else pd.DataFrame()
+    tx_master, rows_added, rows_skipped = update_master_ledger(MASTER_LEDGER_PATH, tx_new)
+    print(f"Rows added to master ledger: {rows_added}")
+    print(f"Rows skipped (duplicates): {rows_skipped}")
+    print(f"Master ledger total: {len(tx_master)}")
 
-    # Basic visibility into de-dupe effect
-    parsed_rows = len(tx_new)
-    master_rows = len(tx_master)
-    removed = parsed_rows - master_rows
-    print(f"Parsed rows (this run): {parsed_rows}")
-    print(f"Master ledger rows (after de-dupe): {master_rows}")
-    print(f"Duplicates removed: {removed if removed > 0 else 0}")
+    # Record file upload metadata
+    append_uploaded_file_row(
+        source_file_id=source_file_id,
+        original_filename=original_filename,
+        input_path=args.input,
+        source_type=args.source_type,
+        institution=args.institution,
+        statement_metadata=statement_meta,
+    )
+    print(f"Recorded in uploaded_files.csv")
+
+    # Record ingestion run stats
+    append_ingestion_run_row(
+        run_id=run_id,
+        source_file_id=source_file_id,
+        rows_parsed=rows_parsed,
+        rows_added=rows_added,
+        rows_skipped=rows_skipped,
+    )
+    print(f"Recorded in ingestion_runs.csv")
 
     if tx_master.empty:
-        raise ValueError("No transactions found after parsing.")
+        raise ValueError("No transactions in master ledger.")
 
-    rules = load_mapping(args.mapping)
+    rules = load_mapping(MAPPING_PATH)
     enriched = enrich_master_ledger(tx_master)
     categorized = categorize_with_mapping(enriched, rules)
     categorized = detect_reversal_pairs(categorized)
-    summary = create_summary(categorized)
-    save_outputs(categorized, summary, args.output, args.summary)
 
-    uncategorized_count = int((categorized["Category"] == "Uncategorized").sum())
+    # Write enriched ledger (denormalized view with all metadata + categorization)
+    write_enriched_ledger(
+        categorized_df=categorized,
+        source_file_id=source_file_id,
+        source_type=args.source_type,
+        institution=args.institution,
+        original_filename=original_filename,
+        statement_metadata=statement_meta,
+    )
+    print(f"Recorded in enriched_ledger.csv")
+
+    summary = create_summary(categorized)
+    save_outputs(categorized, summary, OUTPUT_PATH, SUMMARY_PATH)
+
     print(f"Done. Rows processed: {len(categorized)}")
-    print(f"Uncategorized rows: {uncategorized_count}")
-    print(f"Saved categorized workbook: {args.output}")
-    print(f"Saved category summary: {args.summary}")
+    print(f"Uncategorized: {int((categorized['Category'] == 'Uncategorized').sum())}")
+    print(f"Output: {OUTPUT_PATH}")
+    print(f"Summary: {SUMMARY_PATH}")
 
 
 if __name__ == "__main__":
