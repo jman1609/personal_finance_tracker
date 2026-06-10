@@ -166,28 +166,17 @@ def looks_like_date(value) -> bool:
         return False
     if isinstance(value, (pd.Timestamp, datetime)):
         return True
-    if isinstance(value, (int, float)):
-        return pd.notna(pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce"))
-    return pd.notna(pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True))
+    s = str(value).strip()
+    if not s or s == "nan":
+        return False
+    return pd.notna(pd.to_datetime(s, errors="coerce", dayfirst=True))
 
 
 def parse_date_series(values: pd.Series) -> pd.Series:
-    """Parse mixed-type date column into datetime64[ns]."""
+    """Parse string date column into datetime64[ns]."""
     if values is None:
         return pd.Series(dtype="datetime64[ns]")
-
-    s = values.copy()
-    is_num = s.apply(lambda x: isinstance(x, (int, float)) and not pd.isna(x))
-    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
-
-    if is_num.any():
-        out.loc[is_num] = pd.to_datetime(
-            s.loc[is_num].astype(float), unit="D", origin="1899-12-30", errors="coerce"
-        )
-    if (~is_num).any():
-        out.loc[~is_num] = pd.to_datetime(s.loc[~is_num], errors="coerce", dayfirst=True)
-
-    return out
+    return pd.to_datetime(values, errors="coerce", dayfirst=True)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +208,10 @@ def extract_statement_metadata(raw: pd.DataFrame, header_row: int, tx_df: pd.Dat
 
     # Extract period from transaction dates
     if not tx_df.empty and "Date" in tx_df.columns:
-        dates = pd.to_datetime(tx_df["Date"], errors="coerce")
+        if pd.api.types.is_datetime64_any_dtype(tx_df["Date"]):
+            dates = tx_df["Date"]
+        else:
+            dates = pd.to_datetime(tx_df["Date"], errors="coerce")
         valid_dates = dates[dates.notna()].sort_values()
         period_start = valid_dates.iloc[0].date().isoformat() if len(valid_dates) > 0 else ""
         period_end = valid_dates.iloc[-1].date().isoformat() if len(valid_dates) > 0 else ""
@@ -253,6 +245,7 @@ def parse_statement(
     tx = raw.iloc[header_row + 2:].copy()  # +2 skips the ***** separator row
     tx = tx.iloc[:, :7]
     tx.columns = ["Date", "Narration", "RefNo", "ValueDate", "WithdrawalAmt", "DepositAmt", "ClosingBalance"]
+    tx["Date"] = tx["Date"].astype(str)
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
 
     tx["Date"] = parse_date_series(tx["Date"])
