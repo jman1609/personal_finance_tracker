@@ -450,43 +450,58 @@ def write_enriched_ledger(
     original_filename: str,
     statement_metadata: Dict[str, str],
 ) -> None:
-    """Write categorized transactions to enriched_ledger.csv.
+    """Write enriched_ledger.csv (rebuilt from master_ledger + uploaded_files metadata + categorization).
 
-    Enriched ledger is a denormalized view combining master_ledger + file metadata + categorization.
+    Enriched ledger is fully derived: it joins master_ledger with uploaded_files to get
+    correct source metadata for all transactions (not just the current run).
+    Parameters source_type, institution, original_filename, statement_metadata retained for
+    backwards compatibility but data comes from uploaded_files.csv.
     """
-    out = categorized_df.copy()
-
-    # Add metadata columns
-    out["SourceType"] = source_type
-    out["Institution"] = institution
-    out["AccountOrCardLast4"] = statement_metadata.get("AccountOrCardLast4", "")
-    out["StatementPeriodStart"] = statement_metadata.get("StatementPeriodStart", "")
-    out["StatementPeriodEnd"] = statement_metadata.get("StatementPeriodEnd", "")
-    out["SourceFileName"] = original_filename
-
-    # Add confidence signal
-    out["CategorizationConfidence"] = out.apply(compute_categorization_confidence, axis=1)
-
-    # Keep only enriched_ledger schema columns
-    out = out[[c for c in ENRICHED_LEDGER_COLUMNS if c in out.columns]]
-    out = out.astype(str).fillna("")
-
-    # Append to enriched_ledger.csv
     out_file = Path(ENRICHED_LEDGER_PATH)
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if out_file.exists() and out_file.stat().st_size > 0:
-        existing = pd.read_csv(out_file, dtype=str).fillna("")
-        combined = pd.concat([existing, out], ignore_index=True)
-    else:
-        combined = out
+    master_file = Path(MASTER_LEDGER_PATH)
+    uploaded_file = Path(UPLOADED_FILES_PATH)
 
-    # De-dupe on TransactionId and keep latest
-    if "TransactionId" in combined.columns:
-        combined = combined.drop_duplicates(subset=["TransactionId"], keep="last").reset_index(drop=True)
+    if not master_file.exists() or not uploaded_file.exists():
+        return
 
-    combined = combined[[c for c in ENRICHED_LEDGER_COLUMNS if c in combined.columns]]
-    safe_replace_with_backup(combined, str(out_file))
+    master = pd.read_csv(master_file, dtype=str).fillna("")
+    uploaded = pd.read_csv(uploaded_file, dtype=str).fillna("")
+
+    if "Date" in master.columns:
+        master["Date"] = parse_date_series(master["Date"])
+
+    merged = master.merge(
+        uploaded[["SourceFileId", "SourceType", "Institution", "AccountOrCardLast4", "StatementPeriodStart", "StatementPeriodEnd", "OriginalFileName"]],
+        on="SourceFileId", how="left"
+    )
+    merged = merged.rename(columns={"OriginalFileName": "SourceFileName"})
+
+    if pd.api.types.is_datetime64_any_dtype(merged["Date"]):
+        merged["Date"] = merged["Date"].dt.strftime("%Y-%m-%d")
+
+    categorized_df_sorted = categorized_df.sort_values("TransactionId").reset_index(drop=True)
+
+    merged["Category"] = categorized_df_sorted["Category"].values
+    merged["Subcategory"] = categorized_df_sorted["Subcategory"].values
+    merged["Merchant"] = categorized_df_sorted["Merchant"].values
+    merged["MatchedPattern"] = categorized_df_sorted["MatchedPattern"].values
+    merged["NeedsReview"] = categorized_df_sorted["NeedsReview"].values
+    merged["CategorizationConfidence"] = merged[["Category", "NeedsReview", "MatchedPattern"]].apply(compute_categorization_confidence, axis=1).values
+    merged["ReviewReason"] = categorized_df_sorted["ReviewReason"].values
+    merged["IsReversal"] = categorized_df_sorted["IsReversal"].values
+    merged["ReversalGroupId"] = categorized_df_sorted["ReversalGroupId"].values
+    merged["Flow"] = categorized_df_sorted["Flow"].values
+    merged["PaymentMode"] = categorized_df_sorted["PaymentMode"].values
+    merged["CounterpartyGuess"] = categorized_df_sorted["CounterpartyGuess"].values
+    merged["UPIHandle"] = categorized_df_sorted["UPIHandle"].values
+    merged["TxnIdGuess"] = categorized_df_sorted["TxnIdGuess"].values
+
+    enriched = merged[[c for c in ENRICHED_LEDGER_COLUMNS if c in merged.columns]].copy()
+    enriched = enriched.astype(str).fillna("")
+
+    safe_replace_with_backup(enriched, str(out_file))
 
 
 # ---------------------------------------------------------------------------
