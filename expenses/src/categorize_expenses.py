@@ -125,6 +125,13 @@ def normalize_account_last4(value: str) -> str:
     return digits.zfill(4)[-4:] if digits else ""
 
 
+def extract_account_last4_from_header(header_text: str) -> str:
+    """Extract account last 4 digits from statement header text."""
+    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", header_text, flags=re.IGNORECASE)
+    account_no = account_no_match.group(1) if account_no_match else ""
+    return normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
+
+
 def normalize_description(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
@@ -144,15 +151,26 @@ def compute_transaction_fingerprint(
     signed_amount: float,
     closing_balance: str,
 ) -> str:
-    """SHA-256 fingerprint for stable cross-run de-duplication."""
+    """SHA-256 fingerprint for stable cross-run de-duplication.
+
+    Closing balance is normalized to remove formatting variations (commas, spaces).
+    """
+    normalized_cb = closing_balance.replace(",", "").replace(" ", "").strip() if closing_balance else ""
+    try:
+        normalized_cb = f"{float(normalized_cb):.2f}"
+    except (ValueError, TypeError):
+        normalized_cb = ""
+
+    signed_amount_str = f"{float(signed_amount):.2f}" if signed_amount else "0.00"
+
     parts = "|".join([
         institution.upper().strip(),
         account_last4,
         date_str,
         description_normalized.upper(),
         reference_number,
-        f"{signed_amount:.4f}",
-        closing_balance,
+        signed_amount_str,
+        normalized_cb,
     ])
     return hashlib.sha256(parts.encode()).hexdigest()[:24]
 
@@ -183,12 +201,39 @@ def parse_date_series(values: pd.Series) -> pd.Series:
 # HDFC statement parsing
 # ---------------------------------------------------------------------------
 
-def find_header_row(df: pd.DataFrame) -> int:
+def find_header_row(df: pd.DataFrame) -> Tuple[int, int]:
+    """Find header row and separator row. Returns (header_idx, first_data_idx).
+
+    Robust to formatting variations: case-insensitive, handles extra whitespace.
+    """
+    header_idx = None
     for idx, row in df.iterrows():
-        line = " | ".join([str(v).strip().lower() for v in row.tolist() if pd.notna(v)])
+        row_values = [str(v).strip().lower() for v in row.tolist() if pd.notna(v)]
+        line = " ".join(row_values)
         if all(k in line for k in HDFC_HEADER_KEYWORDS):
-            return idx
-    raise ValueError("Could not find transaction header row in statement.")
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Could not find transaction header row in statement.\n"
+            f"Expected to find these keywords: {', '.join(HDFC_HEADER_KEYWORDS)}\n"
+            "Check that the statement format matches HDFC's expected structure."
+        )
+
+    separator_idx = None
+    for idx in range(header_idx + 1, min(header_idx + 5, len(df))):
+        row_values = [str(v).strip() for v in df.iloc[idx].tolist()]
+        asterisk_count = sum(1 for v in row_values if v and "*" in v)
+        if asterisk_count >= len(row_values) * 0.5:
+            separator_idx = idx
+            break
+
+    if separator_idx is None:
+        separator_idx = header_idx + 1
+
+    first_data_idx = separator_idx + 1
+    return header_idx, first_data_idx
 
 
 def extract_statement_metadata(raw: pd.DataFrame, header_row: int, tx_df: pd.DataFrame, institution: str) -> Dict[str, str]:
@@ -202,16 +247,14 @@ def extract_statement_metadata(raw: pd.DataFrame, header_row: int, tx_df: pd.Dat
         " ".join([c for c in row.tolist() if c and c != "nan"])
         for _, row in header_block.iterrows()
     )
-    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
-    account_no = account_no_match.group(1) if account_no_match else ""
-    last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
+    last4 = extract_account_last4_from_header(flat_text)
 
     # Extract period from transaction dates
     if not tx_df.empty and "Date" in tx_df.columns:
         if pd.api.types.is_datetime64_any_dtype(tx_df["Date"]):
             dates = tx_df["Date"]
         else:
-            dates = pd.to_datetime(tx_df["Date"], errors="coerce")
+            dates = pd.to_datetime(tx_df["Date"], errors="coerce", dayfirst=True)
         valid_dates = dates[dates.notna()].sort_values()
         period_start = valid_dates.iloc[0].date().isoformat() if len(valid_dates) > 0 else ""
         period_end = valid_dates.iloc[-1].date().isoformat() if len(valid_dates) > 0 else ""
@@ -240,9 +283,13 @@ def parse_statement(
     now = datetime.now(timezone.utc).isoformat()
 
     raw = pd.read_excel(input_path, sheet_name=0, header=None)
-    header_row = find_header_row(raw)
+    header_row, first_data_row = find_header_row(raw)
 
-    tx = raw.iloc[header_row + 2:].copy()  # +2 skips the ***** separator row
+    tx = raw.iloc[first_data_row:].copy()
+
+    if len(tx.columns) < 7:
+        raise ValueError(f"Expected at least 7 columns, found {len(tx.columns)}. Statement format may be invalid.")
+
     tx = tx.iloc[:, :7]
     tx.columns = ["Date", "Narration", "RefNo", "ValueDate", "WithdrawalAmt", "DepositAmt", "ClosingBalance"]
     tx["Date"] = tx["Date"].astype(str)
@@ -257,6 +304,11 @@ def parse_statement(
 
     tx["WithdrawalAmount"] = pd.to_numeric(tx["WithdrawalAmt"], errors="coerce").fillna(0.0)
     tx["DepositAmount"] = pd.to_numeric(tx["DepositAmt"], errors="coerce").fillna(0.0)
+
+    if (tx["WithdrawalAmount"] < 0).any() or (tx["DepositAmount"] < 0).any():
+        tx["WithdrawalAmount"] = tx["WithdrawalAmount"].abs()
+        tx["DepositAmount"] = tx["DepositAmount"].abs()
+
     tx["SignedAmount"] = tx["DepositAmount"] - tx["WithdrawalAmount"]
 
     tx["DescriptionRaw"] = tx["Narration"]
@@ -268,9 +320,7 @@ def parse_statement(
         " ".join([c for c in row.tolist() if c and c != "nan"])
         for _, row in header_block.iterrows()
     )
-    account_no_match = re.search(r"Account\s*No\s*:?\s*(\d{8,})", flat_text, flags=re.IGNORECASE)
-    account_no = account_no_match.group(1) if account_no_match else ""
-    account_last4 = normalize_account_last4(account_no[-4:] if len(account_no) >= 4 else "")
+    account_last4 = extract_account_last4_from_header(flat_text)
 
     def make_fingerprint(row):
         date_str = row["Date"].date().isoformat() if pd.notna(row["Date"]) else ""
@@ -304,15 +354,22 @@ def parse_statement(
 # ---------------------------------------------------------------------------
 
 def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
-    """Write CSV safely: write .tmp → backup existing → swap in new file."""
+    """Write CSV safely: write .tmp → backup existing with timestamp → swap in new file."""
     out = Path(final_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-    if out.exists():
-        backup = out.with_name(out.stem + ".backup" + out.suffix)
-        out.replace(backup)
-    tmp.replace(out)
+
+    try:
+        df.to_csv(tmp, index=False, encoding='utf-8')
+        if out.exists():
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup = out.with_name(f"{out.stem}.backup_{timestamp}{out.suffix}")
+            out.replace(backup)
+        tmp.replace(out)
+    except Exception as e:
+        if tmp.exists():
+            tmp.unlink()
+        raise RuntimeError(f"Failed to write {final_path}: {e}")
 
 
 def update_master_ledger(
@@ -326,18 +383,32 @@ def update_master_ledger(
     master_file.parent.mkdir(parents=True, exist_ok=True)
 
     if master_file.exists() and master_file.stat().st_size > 0:
-        existing = pd.read_csv(master_file, dtype=str).fillna("")
+        existing = pd.read_csv(master_file, dtype=str, encoding='utf-8').fillna("")
         if "Date" in existing.columns:
             existing["Date"] = parse_date_series(existing["Date"])
     else:
         existing = pd.DataFrame(columns=MASTER_LEDGER_COLUMNS)
 
-    existing_fingerprints = set(existing["TransactionFingerprint"].tolist()) if not existing.empty else set()
+    intra_batch_dupes = new_rows["TransactionFingerprint"].duplicated()
+    if intra_batch_dupes.any():
+        new_rows = new_rows[~intra_batch_dupes].copy()
+
+    if not existing.empty:
+        required_cols = ["TransactionFingerprint"]
+        missing = [c for c in required_cols if c not in existing.columns]
+        if missing:
+            raise ValueError(f"master_ledger.csv missing required columns: {missing}")
+        existing_fingerprints = set(existing["TransactionFingerprint"].tolist())
+    else:
+        existing_fingerprints = set()
     is_new = ~new_rows["TransactionFingerprint"].isin(existing_fingerprints)
     rows_added = int(is_new.sum())
     rows_skipped = int((~is_new).sum())
 
-    combined = pd.concat([existing, new_rows[is_new]], ignore_index=True)
+    new_rows_to_add = new_rows[is_new].copy().astype(str).fillna("")
+    if "Date" in new_rows_to_add.columns:
+        new_rows_to_add["Date"] = parse_date_series(new_rows_to_add["Date"])
+    combined = pd.concat([existing, new_rows_to_add], ignore_index=True)
     keep_cols = [c for c in MASTER_LEDGER_COLUMNS if c in combined.columns]
     combined = combined[keep_cols].reset_index(drop=True)
 
@@ -356,10 +427,15 @@ def append_uploaded_file_row(
     source_type: str,
     institution: str,
     statement_metadata: Dict[str, str],
+    rows_parsed: int = 0,
+    rows_added: int = 0,
 ) -> None:
     """Append one row to uploaded_files.csv."""
     file_hash = compute_file_hash(input_path)
     now = datetime.now(timezone.utc).isoformat()
+
+    parsed_status = "PARSED" if rows_parsed > 0 else "PARSE_FAILED"
+    validation_status = "PASSED" if rows_parsed > 0 and rows_added > 0 else ("PASSED_DUPLICATES" if rows_parsed > 0 else "FAILED")
 
     row_data = {
         "SourceFileId": source_file_id,
@@ -373,8 +449,8 @@ def append_uploaded_file_row(
         "StatementPeriodEnd": statement_metadata.get("StatementPeriodEnd", ""),
         "TotalTransactionsInFile": statement_metadata.get("TotalTransactionsInFile", 0),
         "UploadedAt": now,
-        "ParsedStatus": "PARSED",
-        "ValidationStatus": "PENDING",
+        "ParsedStatus": parsed_status,
+        "ValidationStatus": validation_status,
     }
 
     row_df = pd.DataFrame([row_data])
@@ -384,7 +460,7 @@ def append_uploaded_file_row(
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     if out_file.exists() and out_file.stat().st_size > 0:
-        existing = pd.read_csv(out_file, dtype=str).fillna("")
+        existing = pd.read_csv(out_file, dtype=str, encoding='utf-8').fillna("")
         combined = pd.concat([existing, row_df], ignore_index=True)
     else:
         combined = row_df
@@ -399,9 +475,12 @@ def append_ingestion_run_row(
     rows_parsed: int,
     rows_added: int,
     rows_skipped: int,
+    rows_failed_validation: int = 0,
 ) -> None:
     """Append one row to ingestion_runs.csv."""
     now = datetime.now(timezone.utc).isoformat()
+
+    status = "SUCCESS" if rows_added > 0 else ("DUPLICATE_SKIP" if rows_skipped > 0 else "FAILED")
 
     row_data = {
         "RunId": run_id,
@@ -409,10 +488,10 @@ def append_ingestion_run_row(
         "RowsParsed": rows_parsed,
         "RowsAdded": rows_added,
         "RowsSkippedAsDuplicates": rows_skipped,
-        "RowsFailedValidation": 0,
+        "RowsFailedValidation": rows_failed_validation,
         "StartedAt": now,
         "CompletedAt": now,
-        "Status": "SUCCESS",
+        "Status": status,
     }
 
     row_df = pd.DataFrame([row_data])
@@ -422,7 +501,7 @@ def append_ingestion_run_row(
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     if out_file.exists() and out_file.stat().st_size > 0:
-        existing = pd.read_csv(out_file, dtype=str).fillna("")
+        existing = pd.read_csv(out_file, dtype=str, encoding='utf-8').fillna("")
         combined = pd.concat([existing, row_df], ignore_index=True)
     else:
         combined = row_df
@@ -466,8 +545,21 @@ def write_enriched_ledger(
     if not master_file.exists() or not uploaded_file.exists():
         return
 
-    master = pd.read_csv(master_file, dtype=str).fillna("")
-    uploaded = pd.read_csv(uploaded_file, dtype=str).fillna("")
+    master = pd.read_csv(master_file, dtype=str, encoding='utf-8').fillna("")
+    uploaded = pd.read_csv(uploaded_file, dtype=str, encoding='utf-8').fillna("")
+
+    required_master_cols = ["TransactionId", "Date", "DescriptionNormalized", "SourceFileId"]
+    missing_master = [c for c in required_master_cols if c not in master.columns]
+    if missing_master:
+        raise ValueError(f"master_ledger.csv missing required columns: {missing_master}")
+
+    required_uploaded_cols = ["SourceFileId", "SourceType", "Institution"]
+    missing_uploaded = [c for c in required_uploaded_cols if c not in uploaded.columns]
+    if missing_uploaded:
+        raise ValueError(f"uploaded_files.csv missing required columns: {missing_uploaded}")
+
+    if uploaded["SourceFileId"].duplicated().any():
+        raise ValueError("uploaded_files.csv contains duplicate SourceFileId values. Data integrity check failed.")
 
     if "Date" in master.columns:
         master["Date"] = parse_date_series(master["Date"])
@@ -481,24 +573,19 @@ def write_enriched_ledger(
     if pd.api.types.is_datetime64_any_dtype(merged["Date"]):
         merged["Date"] = merged["Date"].dt.strftime("%Y-%m-%d")
 
-    categorized_df_sorted = categorized_df.sort_values("TransactionId").reset_index(drop=True)
+    categorization_cols = ["TransactionId", "Category", "Subcategory", "Merchant", "MatchedPattern", "NeedsReview", "ReviewReason", "IsReversal", "ReversalGroupId", "Flow", "PaymentMode", "CounterpartyGuess", "UPIHandle", "TxnIdGuess"]
+    categorized_for_merge = categorized_df[categorization_cols].copy()
 
-    merged["Category"] = categorized_df_sorted["Category"].values
-    merged["Subcategory"] = categorized_df_sorted["Subcategory"].values
-    merged["Merchant"] = categorized_df_sorted["Merchant"].values
-    merged["MatchedPattern"] = categorized_df_sorted["MatchedPattern"].values
-    merged["NeedsReview"] = categorized_df_sorted["NeedsReview"].values
-    merged["CategorizationConfidence"] = merged[["Category", "NeedsReview", "MatchedPattern"]].apply(compute_categorization_confidence, axis=1).values
-    merged["ReviewReason"] = categorized_df_sorted["ReviewReason"].values
-    merged["IsReversal"] = categorized_df_sorted["IsReversal"].values
-    merged["ReversalGroupId"] = categorized_df_sorted["ReversalGroupId"].values
-    merged["Flow"] = categorized_df_sorted["Flow"].values
-    merged["PaymentMode"] = categorized_df_sorted["PaymentMode"].values
-    merged["CounterpartyGuess"] = categorized_df_sorted["CounterpartyGuess"].values
-    merged["UPIHandle"] = categorized_df_sorted["UPIHandle"].values
-    merged["TxnIdGuess"] = categorized_df_sorted["TxnIdGuess"].values
+    merged = merged.merge(categorized_for_merge, on="TransactionId", how="left")
+    merged["CategorizationConfidence"] = merged[["Category", "NeedsReview", "MatchedPattern"]].apply(compute_categorization_confidence, axis=1)
 
     enriched = merged[[c for c in ENRICHED_LEDGER_COLUMNS if c in merged.columns]].copy()
+
+    if "NeedsReview" in enriched.columns:
+        enriched["NeedsReview"] = enriched["NeedsReview"].astype(bool).astype(int).astype(str)
+    if "IsReversal" in enriched.columns:
+        enriched["IsReversal"] = enriched["IsReversal"].astype(bool).astype(int).astype(str)
+
     enriched = enriched.astype(str).fillna("")
 
     safe_replace_with_backup(enriched, str(out_file))
@@ -514,6 +601,11 @@ def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
 
     if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
         df["Date"] = parse_date_series(df["Date"])
+
+    if df["Date"].isna().any():
+        invalid_date_count = df["Date"].isna().sum()
+        df.loc[df["Date"].isna(), "NeedsReview"] = True
+        df.loc[df["Date"].isna() & df["ReviewReason"].eq(""), "ReviewReason"] = "NO_DATE"
 
     for col in ["WithdrawalAmount", "DepositAmount", "SignedAmount"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -556,8 +648,18 @@ def normalize_merchant_key(narration: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_mapping(mapping_path: str) -> list:
-    with open(mapping_path, "r", encoding="utf-8") as f:
-        return json.load(f).get("rules", [])
+    try:
+        with open(mapping_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("rules", [])
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Category mapping file not found: {mapping_path}\n"
+            f"Expected location: {Path(mapping_path).resolve()}\n"
+            f"Create a category mapping JSON file with a 'rules' array."
+        )
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {mapping_path}: {e}")
 
 
 def categorize_with_mapping(df: pd.DataFrame, rules: list) -> pd.DataFrame:
@@ -604,8 +706,11 @@ def categorize_with_mapping(df: pd.DataFrame, rules: list) -> pd.DataFrame:
 # Reversal detection
 # ---------------------------------------------------------------------------
 
-def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_tolerance: float = 1.0) -> pd.DataFrame:
-    """Pair likely reversal/refund transactions by MerchantKey, opposite sign, within day_window."""
+def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_tolerance: float = 0.01) -> pd.DataFrame:
+    """Pair likely reversal/refund transactions by MerchantKey, opposite sign, within day_window.
+
+    Stricter criteria: amount_tolerance reduced to 0.01 to avoid pairing unrelated transactions.
+    """
     out = df.copy().reset_index(drop=True)
     out["IsReversal"] = False
     out["ReversalGroupId"] = ""
@@ -620,7 +725,7 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
     work = work.sort_values(["MerchantKey", "_abs_amount", "Date", "_row_pos"]).reset_index(drop=True)
     used: set = set()
 
-    for _key, g in work.groupby("MerchantKey", sort=False):
+    for _key, g in work[work["MerchantKey"].str.strip() != ""].groupby("MerchantKey", sort=False):
         if len(g) < 2:
             continue
         rows = g.to_dict("records")
@@ -653,7 +758,11 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
                 break
 
     out.loc[out["IsReversal"], "NeedsReview"] = True
-    out.loc[out["IsReversal"] & out["ReviewReason"].eq(""), "ReviewReason"] = "REVERSAL_SUSPECTED"
+    for pos in out[out["IsReversal"]].index:
+        if out.loc[pos, "ReviewReason"]:
+            out.loc[pos, "ReviewReason"] = out.loc[pos, "ReviewReason"] + "|REVERSAL_SUSPECTED"
+        else:
+            out.loc[pos, "ReviewReason"] = "REVERSAL_SUSPECTED"
     return out
 
 
@@ -706,9 +815,23 @@ def main():
     parser.add_argument("--source-type", required=True, help="Source type (e.g., Bank Account, Credit Card)")
     args = parser.parse_args()
 
+    original_filename = Path(args.input).name
+    file_hash = compute_file_hash(args.input)
+
+    uploaded_file = Path(UPLOADED_FILES_PATH)
+    if uploaded_file.exists() and uploaded_file.stat().st_size > 0:
+        existing_uploads = pd.read_csv(uploaded_file, dtype=str, encoding='utf-8')
+        duplicate = existing_uploads[
+            (existing_uploads["FileHash"] == file_hash) &
+            (existing_uploads["ParsedStatus"] == "PARSED")
+        ]
+        if not duplicate.empty:
+            print(f"File already processed: {original_filename} (hash: {file_hash[:16]}...)")
+            print(f"Skipping re-ingestion.")
+            return
+
     source_file_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
-    original_filename = Path(args.input).name
 
     print(f"Parsing: {args.input}")
     tx_new, statement_meta = parse_statement(args.input, source_file_id, args.institution, args.source_type)
@@ -728,6 +851,8 @@ def main():
         source_type=args.source_type,
         institution=args.institution,
         statement_metadata=statement_meta,
+        rows_parsed=rows_parsed,
+        rows_added=rows_added,
     )
     print(f"Recorded in uploaded_files.csv")
 
