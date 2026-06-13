@@ -148,11 +148,32 @@ Currently supports:
    - Large serial numbers (1483155.5) parse as far-future dates
    - Tip: If you see 1899-12-30 in a date field, check for mixed-type columns and serial number junk
 
+### Additional Fixes (Post-Session)
+
+4. **enriched_ledger Data Loss Bug** ✅ **FIXED**
+   - *Issue:* When multiple files ingested, enriched_ledger was only keeping data from the last file (overwriting SourceFileName for all rows).
+   - *Root Cause:* `write_enriched_ledger()` was setting SourceFileName for all rows with current run's filename, not preserving historical source metadata.
+   - *Solution Applied (commit fc882b3):*
+     - Rebuild enriched_ledger by joining `master_ledger` with `uploaded_files` metadata
+     - This ensures each transaction retains correct source file attribution across all runs
+   - *Result:* All 2285 rows now preserved with correct source info (Account 0112: 250 rows, Account 0683: 2035 rows)
+
+5. **Streamlit Dashboard** ✅ **CREATED**
+   - Simple UI for expense visualization at `expenses/ui/dashboard.py`
+   - 4 tabs: Category breakdown, Monthly trends, Top merchants, Transaction details
+   - Filters: Date range, Category multi-select
+   - KPIs: Total spend, income, net flow, transaction count
+   - Run: `streamlit run expenses/ui/dashboard.py`
+
 ### Files Changed
-- `expenses/src/categorize_expenses.py` (commits b999ca7, 660be42)
+- `expenses/src/categorize_expenses.py` (commits b999ca7, 660be42, fc882b3)
   - CSV type consistency fixes
   - Reversal matching reverted to original params (7 days, ±1.0)
   - Date parsing refactored (string-only)
+  - enriched_ledger rebuilt via master_ledger + uploaded_files join
+- `expenses/ui/dashboard.py` (commit 6dd7fa0)
+  - Streamlit dashboard with charts and filters
+  - KPI cards and transaction table
 
 ---
 
@@ -171,17 +192,22 @@ Currently supports:
   - [x] Date parsing edge cases (string-only refactor)
 - [x] **Test Scenario 1 (Happy Path):** Single file, all outputs created, counts correct
 - [x] **Test Scenario 2/3 (Overlap & Merge):** De-duplication and merging work correctly
+- [x] **Test Scenario 4 (Reversal Pairing):** No false positives (0 reversals in test data)
+- [x] **Test Scenario 5 (Categorization):** 40% coverage, confidence levels correct (HIGH/MEDIUM/LOW/NONE)
+- [x] **Test Scenario 6 (Data Type Consistency):** All types preserved, no "nan" strings, sums match
+- [x] **Test Scenario 7 (Error Handling):** Clear errors on bad input (missing args, bad file, bad format)
+- [x] **Fix enriched_ledger bug:** All accounts preserved across multiple file ingestions
+- [x] **Build Streamlit dashboard:** Charts, filters, KPIs, transaction table
 
 ### ⏳ Next (In Priority Order)
-1. **Test Scenario 4 (Reversal Pairing)** — Verify refund pairing logic, no false positives
-2. **Test Scenario 5 (Categorization Coverage)** — Verify mapping rules, confidence levels
-3. **Test Scenario 6 (Data Type Consistency)** — CSV round-trip, no data corruption
-4. **Test Scenario 7 (Error Handling)** — Graceful failures on bad input
-5. **Folder Structure Refactor** — Consolidate to `data/raw/` and `data/db/` (optional, lower priority)
-6. **Medium-Priority Fixes:**
+1. **Improve Categorization Coverage** — Add UPI, NEFT, IMPS, INTEREST, FD patterns to boost from 40% → ~50%
+2. **Test Credit Card Integration** — Check format of HDFC CC statements, adapt parser if needed
+3. **Merge Bank + Credit Card Data** — Single dashboard view of all spending
+4. **Folder Structure Refactor** (optional) — Consolidate to `data/raw/` and `data/db/`
+5. **Medium-Priority Fixes:**
    - Centralize account extraction (currently in 2 places)
-   - Persist reversal fields if needed for UI/reporting
    - Add transaction validation before master_ledger write
+   - Persist reversal fields if needed for future UI features
 
 ## Security / Git Hygiene
 Never commit: real bank/credit-card statements, `.env`, generated outputs, virtual environments, `expenses/db/` data files.
