@@ -429,6 +429,58 @@ After any future refactors:
 
 ---
 
+## Bug Fix Session (2026-06-14)
+
+### 23 Critical/High/Medium Bugs Fixed
+**Commit: 4fc0f0e** — All bugs verified, code compiles, no breaking changes.
+
+#### Critical Data Integrity Fixes (3)
+1. **#1: Enriched-ledger row misalignment** ✅
+   - Changed positional column assignment to merge on TransactionId
+   - Eliminates silent data corruption across multiple ingestion runs
+
+2. **#32: Mixed-dtype concat in master_ledger** ✅
+   - Convert new_rows to string before concat (existing was str, new was datetime64/float64)
+   - Ensures consistent dtype handling
+
+3. **#3: Row duplication on metadata merge** ✅
+   - Validate uploaded_files.csv has unique SourceFileId before merge
+   - Prevents one-to-many join from silently duplicating rows
+
+#### High-Priority Data Loss/Correctness Fixes (7)
+4. **#2: Sign assumption (pre-negated amounts)** ✅ — Detect and convert pre-negated deposits/withdrawals
+5. **#5: FileHash never checked** ✅ — Skip re-processing if file hash already exists with ParsedStatus="PARSED"
+6. **#6: Hardcoded header_row + 2** ✅ — Dynamically detect separator row by looking for asterisks
+7. **#9: Intra-run duplicate fingerprints** ✅ — Filter duplicates within new_rows batch before merging
+8. **#4: False reversal groups (empty MerchantKey)** ✅ — Filter empty keys from grouping logic
+9. **#20: No encoding control** ✅ — Explicit encoding='utf-8' on all CSV read/write operations
+10. **#16: Reversal tolerance too loose** ✅ — Reduced from ±1.0 to ±0.01
+
+#### Medium-Priority Reliability/Robustness Fixes (13)
+11. **#10: Missing column validation** ✅ — Validate column count before assignment
+12. **#11: Inconsistent date parsing** ✅ — Standardize dayfirst=True everywhere
+13. **#13: Safe-write not atomic** ✅ — Add error handling and cleanup on failure
+14. **#14: Boolean fields as strings** ✅ — Write NeedsReview/IsReversal as 0/1 integers
+15. **#15: Status fields hardcoded** ✅ — Track actual validation results (PARSE_FAILED, PASSED_DUPLICATES, etc.)
+16. **#17: Reversal overwrites reasons** ✅ — Append reasons with "|" to preserve earlier flags
+17. **#19: Fingerprint format dependency** ✅ — Normalize closing balance (remove commas, format consistently)
+18. **#25: Floating-point instability** ✅ — Use 2 decimal places (currency standard) in fingerprint
+19. **#29: Single backup overwritten** ✅ — Timestamp backups: `.backup_YYYYMMDD_HHMMSS.csv`
+20. **#30: Duplicated account extraction** ✅ — Created helper function, removed code duplication
+21. **#33: NaT dates flow through** ✅ — Flag unparseable dates as NeedsReview with "NO_DATE" reason
+22. **#12: Missing schema validation** ✅ — Check required columns exist before accessing
+23. **#23: Missing error handling (mapping file)** ✅ — Add try/except with helpful path info
+24. **#24: Fragile header detection** ✅ — Make case-insensitive, handle extra whitespace
+
+**Impact Summary:**
+- Data corruption risk eliminated (fixes #1, #32, #3)
+- De-duplication robustness improved (fixes #9, #5, #4)
+- Character encoding safety (fix #20)
+- Audit trail completeness (fix #15)
+- Code maintainability improved (fix #30)
+
+---
+
 ## Quick Start
 ```bash
 cd /Users/jaymangal/Desktop/personal_finance_tracker

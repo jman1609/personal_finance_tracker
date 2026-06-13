@@ -604,6 +604,10 @@ def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
 
     if df["Date"].isna().any():
         invalid_date_count = df["Date"].isna().sum()
+        if "NeedsReview" not in df.columns:
+            df["NeedsReview"] = False
+        if "ReviewReason" not in df.columns:
+            df["ReviewReason"] = ""
         df.loc[df["Date"].isna(), "NeedsReview"] = True
         df.loc[df["Date"].isna() & df["ReviewReason"].eq(""), "ReviewReason"] = "NO_DATE"
 
