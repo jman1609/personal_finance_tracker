@@ -200,11 +200,13 @@ Currently supports:
 - [x] **Build Streamlit dashboard:** Charts, filters, KPIs, transaction table
 
 ### ⏳ Next (In Priority Order)
-1. **Improve Categorization Coverage** — Add UPI, NEFT, IMPS, INTEREST, FD patterns to boost from 40% → ~50%
-2. **Test Credit Card Integration** — Check format of HDFC CC statements, adapt parser if needed
-3. **Merge Bank + Credit Card Data** — Single dashboard view of all spending
-4. **Folder Structure Refactor** (optional) — Consolidate to `data/raw/` and `data/db/`
-5. **Medium-Priority Fixes:**
+1. **Test Scenarios 4-7** — Reversal pairing, categorization coverage, type consistency, error handling (see Testing Plan below)
+2. **Improve Categorization Coverage** — Currently 60% uncategorized (1368/2285 rows). Check `enriched_ledger.csv` (filter `Category=="Uncategorized"`), group by `PaymentMode`/`DescriptionNormalized` to find patterns. Top gaps: UPI (1075), ACH C (116), NEFT CR (54), CC AUTOPAY (16), IMPS (15), INTEREST (6+5). Add rules to `expenses/config/category_mapping.json`.
+3. **Test Credit Card Integration** — Jay to provide a real HDFC CC statement. Check format vs bank statement parser, adapt `parse_statement()`/`find_header_row()` if needed (HDFC CC layout likely differs from savings account layout).
+4. **Merge Bank + Credit Card Data** — Single dashboard view of all spending across account types.
+5. **Backup File Cleanup** — `safe_replace_with_backup()` creates a new timestamped `.backup_YYYYMMDD_HHMMSS.csv` on every run with no cleanup (8 backup files currently in `expenses/db/`). Add retention: keep only the latest backup per file (delete older ones after successful write), or gitignore `*.backup_*` entirely.
+6. **Folder Structure Refactor** (optional) — Consolidate `expenses/db/` under `expenses/data/db/` so all data lives under one `data/` tree (`data/raw/`, `data/processed/`, `data/db/`). Not started — needs a decision on target layout before executing (touches all hardcoded paths at top of `categorize_expenses.py`).
+7. **Medium-Priority Fixes:**
    - Centralize account extraction (currently in 2 places)
    - Add transaction validation before master_ledger write
    - Persist reversal fields if needed for future UI features
@@ -414,10 +416,50 @@ Run in this order:
   - Account 0683 first statement: 1240 rows
   - Account 0683 second statement: 1567 parsed, 772 duplicates, 795 new rows added
   - Total master_ledger: 2285 rows (250 + 1240 + 795)
-- [ ] Scenario 4: Reversal pairing
-- [ ] Scenario 5: Categorization & confidence
-- [ ] Scenario 6: Data type consistency
-- [ ] Scenario 7: Error handling
+- [x] **Scenario 4: Reversal pairing** ✅ PASSED (2026-06-14, after re-ingestion)
+  - 7 reversal pairs (14 rows) detected, all verified legitimate:
+    - 2x Shubhi Gupta UPI pairs (₹8700, same day)
+    - 1x Himanshu Chourasiya UPI refund (₹250)
+    - 1x **Zomato order + Razorpay refund** (₹354.20) — textbook reversal case
+    - 3x monthly inter-account transfers (own accounts 0683↔0112, ₹50000 each)
+  - No false positives
+- [ ] Scenario 5: Categorization & confidence (deferred — Jay working on coverage separately)
+- [x] **Scenario 6: Data type consistency** ✅ PASSED (2026-06-14)
+  - Sum(SignedAmount) reconciles exactly between master_ledger and enriched_ledger: ₹661,855.55
+  - No "nan" strings; 0 blank dates (down from 1386 before fix — see Critical Bug below)
+- [x] **Scenario 7: Error handling** ✅ PASSED (2026-06-14, after fix)
+  - Missing --institution → clean argparse error ✅
+  - Invalid file path → FileNotFoundError (raw traceback, not formatted — minor, acceptable) ⚠️
+  - Missing category_mapping.json → clean error with expected path ✅
+  - Malformed Excel (no HDFC headers) → clean "Could not find transaction header row" ✅
+  - Empty statement (header-only, 0 data rows) → was crashing with `KeyError: 'Date'`, now raises clean `ValueError` (fixed, see below) ✅
+
+---
+
+## 🔴 Critical Bug Fixed (2026-06-14): Date Corruption via Repeated `dayfirst=True` Parsing
+
+**Discovered while investigating why master_ledger.csv had 1386/2285 (60%) blank `Date` values.**
+
+### Root Cause
+`parse_date_series()` applied `dayfirst=True` unconditionally. The pipeline re-parses dates multiple times:
+1. `parse_statement()`: raw `"11/12/25"` (DD/MM/YY) → correctly parsed with dayfirst=True → `2025-12-11` ✅
+2. `update_master_ledger()`: `.astype(str)` → `"2025-12-11"` (now ISO format) → **re-parsed with dayfirst=True** → dateutil swaps the last two components of the ISO string → `2025-11-12` ❌ (or `NaT` if the swapped "month" > 12, e.g. `"2026-01-23"` → swap → month=23 → invalid → blank)
+3. Every subsequent run re-reads the ISO dates from CSV and re-corrupts them further
+
+**Impact:** ~60% of rows had either silently swapped month/day (wrong date, looked valid) or blank dates (when day>12). This corrupted `Year`/`Month`/`Day` derived fields, monthly summaries, and reversal date-window matching for the majority of transactions. Data was generated 2026-06-10, before this was caught.
+
+### Fix (commit pending)
+`parse_date_series()` now tries ISO format (`%Y-%m-%d`) first — unambiguous, no dayfirst needed — and only falls back to `dayfirst=True` dateutil parsing for strings that aren't ISO (i.e., raw HDFC `DD/MM/YY` dates).
+
+### Remediation
+Reset `master_ledger.csv`, `enriched_ledger.csv`, `uploaded_files.csv`, `ingestion_runs.csv` to header-only and re-ingested all 3 source files fresh:
+- Row counts identical to before (250 / 1240 / 795+772 dedup / 2285 total) — confirms no data loss
+- **0 blank dates** (was 1386)
+- Sample verified: raw `23/01/26` → `2026-01-23` (previously blank)
+- Reversal pairs jumped from 4→14 (the previously-blank-date rows couldn't be matched for reversal pairing before)
+- All 26 unit tests still pass
+
+**Lesson:** Be very careful mixing `dayfirst=True` with values that may already be in ISO format. Any date column that round-trips through CSV needs format-aware parsing, not a blanket dayfirst flag.
 
 ### Unit Tests
 

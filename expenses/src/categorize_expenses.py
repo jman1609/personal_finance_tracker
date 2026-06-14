@@ -191,10 +191,21 @@ def looks_like_date(value) -> bool:
 
 
 def parse_date_series(values: pd.Series) -> pd.Series:
-    """Parse string date column into datetime64[ns]."""
+    """Parse string date column into datetime64[ns].
+
+    Tries unambiguous ISO format (YYYY-MM-DD) first, since round-tripped
+    dates (e.g. from master_ledger.csv) are stored this way and dayfirst=True
+    would incorrectly swap month/day on ISO strings. Falls back to
+    dayfirst=True parsing for raw statement dates (DD/MM/YY).
+    """
     if values is None:
         return pd.Series(dtype="datetime64[ns]")
-    return pd.to_datetime(values, errors="coerce", dayfirst=True)
+    parsed = pd.to_datetime(values, format="%Y-%m-%d", errors="coerce")
+    remaining = parsed.isna()
+    if remaining.any():
+        fallback = pd.to_datetime(values[remaining], errors="coerce", dayfirst=True)
+        parsed = parsed.where(~remaining, fallback)
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +303,8 @@ def parse_statement(
 
     tx = tx.iloc[:, :7]
     tx.columns = ["Date", "Narration", "RefNo", "ValueDate", "WithdrawalAmt", "DepositAmt", "ClosingBalance"]
+    if tx.empty:
+        raise ValueError("No transaction rows found in statement (file appears to be header-only).")
     tx["Date"] = tx["Date"].astype(str)
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
 
