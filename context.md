@@ -200,13 +200,11 @@ Currently supports:
 - [x] **Build Streamlit dashboard:** Charts, filters, KPIs, transaction table
 
 ### ⏳ Next (In Priority Order)
-1. **Test Scenarios 4-7** — Reversal pairing, categorization coverage, type consistency, error handling (see Testing Plan below)
-2. **Improve Categorization Coverage** — Currently 60% uncategorized (1368/2285 rows). Check `enriched_ledger.csv` (filter `Category=="Uncategorized"`), group by `PaymentMode`/`DescriptionNormalized` to find patterns. Top gaps: UPI (1075), ACH C (116), NEFT CR (54), CC AUTOPAY (16), IMPS (15), INTEREST (6+5). Add rules to `expenses/config/category_mapping.json`.
-3. **Test Credit Card Integration** — Jay to provide a real HDFC CC statement. Check format vs bank statement parser, adapt `parse_statement()`/`find_header_row()` if needed (HDFC CC layout likely differs from savings account layout).
-4. **Merge Bank + Credit Card Data** — Single dashboard view of all spending across account types.
-5. **Backup File Cleanup** — `safe_replace_with_backup()` creates a new timestamped `.backup_YYYYMMDD_HHMMSS.csv` on every run with no cleanup (8 backup files currently in `expenses/db/`). Add retention: keep only the latest backup per file (delete older ones after successful write), or gitignore `*.backup_*` entirely.
-6. **Folder Structure Refactor** (optional) — Consolidate `expenses/db/` under `expenses/data/db/` so all data lives under one `data/` tree (`data/raw/`, `data/processed/`, `data/db/`). Not started — needs a decision on target layout before executing (touches all hardcoded paths at top of `categorize_expenses.py`).
-7. **Medium-Priority Fixes:**
+1. **Improve Categorization Coverage** — Currently 60% uncategorized (1368/2285 rows). Check `enriched_ledger.csv` (filter `Category=="Uncategorized"`), group by `PaymentMode`/`DescriptionNormalized` to find patterns. Top gaps: UPI (1075), ACH C (116), NEFT CR (54), CC AUTOPAY (16), IMPS (15), INTEREST (6+5). Add rules to `expenses/config/category_mapping.json`.
+2. **Test Credit Card Integration** — Jay to provide a real HDFC CC statement. Check format vs bank statement parser, adapt `parse_statement()`/`find_header_row()` if needed (HDFC CC layout likely differs from savings account layout).
+3. **Merge Bank + Credit Card Data** — Single dashboard view of all spending across account types.
+4. **Folder Structure Refactor** (optional) — Consolidate `expenses/db/` under `expenses/data/db/` so all data lives under one `data/` tree (`data/raw/`, `data/processed/`, `data/db/`). Not started — needs a decision on target layout before executing (touches all hardcoded paths at top of `categorize_expenses.py`).
+5. **Medium-Priority Fixes:**
    - Centralize account extraction (currently in 2 places)
    - Add transaction validation before master_ledger write
    - Persist reversal fields if needed for future UI features
@@ -460,6 +458,24 @@ Reset `master_ledger.csv`, `enriched_ledger.csv`, `uploaded_files.csv`, `ingesti
 - All 26 unit tests still pass
 
 **Lesson:** Be very careful mixing `dayfirst=True` with values that may already be in ISO format. Any date column that round-trips through CSV needs format-aware parsing, not a blanket dayfirst flag.
+
+---
+
+## Follow-up Improvements (2026-06-14, same session)
+
+### 1. Robust Date Format Detection (replaces hardcoded `dayfirst=True` for raw parsing)
+**Problem:** `dayfirst=True` was a hardcoded assumption about HDFC's date format. A different bank, or HDFC at a different time, could use `MM/DD/YYYY` etc., and dayfirst alone can't disambiguate when every date has day≤12.
+
+**Solution:** New `detect_date_format()` function — examines **all distinct date strings** in the statement (not a sample), narrows candidate formats by separator + component lengths (2 vs 4-digit year), then validates via strict `pd.to_datetime(..., format=fmt, errors="raise")`. If exactly one candidate parses all values, that's the format. If 0 → clear error. If 2+ → genuinely ambiguous (every date has day & month ≤12) → clear error asking for more data, rather than silently guessing wrong.
+
+`parse_statement()` now calls this once per file and parses raw dates with the detected format directly to ISO — no more dayfirst guessing on raw input.
+
+### 2. Backup Retention — Keep Only Latest
+**Problem:** `safe_replace_with_backup()` created a new timestamped `.backup_YYYYMMDD_HHMMSS.csv` on every run with no cleanup — 8 backup files had accumulated in `expenses/db/`.
+
+**Solution:** Before creating a new backup, delete all existing `{name}.backup_*.csv` files for that target. Result: exactly 1 backup per file at all times (most recent pre-write snapshot), enabling one-step rollback without unbounded growth.
+
+**Verified:** Re-ran ingestion 3x — exactly 4 backup files exist afterward (1 per CSV: master_ledger, enriched_ledger, uploaded_files, ingestion_runs), all dates correct (0 blanks), row counts unchanged (2285), all 26 unit tests pass.
 
 ### Unit Tests
 

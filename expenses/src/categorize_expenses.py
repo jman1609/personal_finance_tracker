@@ -190,6 +190,61 @@ def looks_like_date(value) -> bool:
     return pd.notna(pd.to_datetime(s, errors="coerce", dayfirst=True))
 
 
+def detect_date_format(date_strings) -> str:
+    """Detect the date format used by a statement from its full set of date strings.
+
+    Uses ALL distinct values (not a sample) so day/month ambiguity is resolved
+    whenever any date in the file has a day-of-month > 12. Raises ValueError if
+    the format can't be determined or remains genuinely ambiguous.
+    """
+    distinct = sorted({
+        s.strip() for s in date_strings
+        if s and str(s).strip() and str(s).strip().lower() != "nan"
+    })
+    if not distinct:
+        raise ValueError("No date values available to detect date format.")
+
+    sample = distinct[0]
+    sep = next((c for c in sample if not c.isalnum()), None)
+    if sep is None:
+        raise ValueError(f"Could not determine date separator from sample value: '{sample}'")
+
+    parts = sample.split(sep)
+    if len(parts) != 3:
+        raise ValueError(f"Unexpected date structure (expected 3 parts separated by '{sep}'): '{sample}'")
+
+    lengths = [len(p) for p in parts]
+    if lengths[0] == 4:
+        candidates = [f"%Y{sep}%m{sep}%d"]
+    elif lengths[2] == 4:
+        candidates = [f"%d{sep}%m{sep}%Y", f"%m{sep}%d{sep}%Y"]
+    elif lengths[2] == 2:
+        candidates = [f"%d{sep}%m{sep}%y", f"%m{sep}%d{sep}%y"]
+    else:
+        raise ValueError(f"Could not infer date format from sample value: '{sample}'")
+
+    series = pd.Series(distinct)
+    valid_formats = []
+    for fmt in candidates:
+        try:
+            pd.to_datetime(series, format=fmt, errors="raise")
+            valid_formats.append(fmt)
+        except (ValueError, TypeError):
+            continue
+
+    if len(valid_formats) == 1:
+        return valid_formats[0]
+    if not valid_formats:
+        raise ValueError(
+            f"Could not detect date format. Tried {candidates}. Sample values: {distinct[:5]}"
+        )
+    raise ValueError(
+        f"Date format is ambiguous between {valid_formats} - every date's day and month "
+        f"positions are <= 12, so multiple formats parse successfully. "
+        f"Sample values: {distinct[:5]}"
+    )
+
+
 def parse_date_series(values: pd.Series) -> pd.Series:
     """Parse string date column into datetime64[ns].
 
@@ -307,8 +362,11 @@ def parse_statement(
         raise ValueError("No transaction rows found in statement (file appears to be header-only).")
     tx["Date"] = tx["Date"].astype(str)
     tx = tx[tx["Date"].apply(looks_like_date)].copy()
+    if tx.empty:
+        raise ValueError("No valid transaction dates found in statement after filtering.")
 
-    tx["Date"] = parse_date_series(tx["Date"])
+    date_format = detect_date_format(tx["Date"].tolist())
+    tx["Date"] = pd.to_datetime(tx["Date"], format=date_format, errors="coerce")
     tx["Narration"] = tx["Narration"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
     tx["RefNo"] = tx["RefNo"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
 
@@ -367,7 +425,11 @@ def parse_statement(
 # ---------------------------------------------------------------------------
 
 def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
-    """Write CSV safely: write .tmp → backup existing with timestamp → swap in new file."""
+    """Write CSV safely: write .tmp -> backup existing with timestamp -> swap in new file.
+
+    Only the most recent backup per file is retained; older timestamped
+    backups are removed once the new one is created.
+    """
     out = Path(final_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -377,6 +439,8 @@ def safe_replace_with_backup(df: pd.DataFrame, final_path: str):
         if out.exists():
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             backup = out.with_name(f"{out.stem}.backup_{timestamp}{out.suffix}")
+            for old_backup in out.parent.glob(f"{out.stem}.backup_*{out.suffix}"):
+                old_backup.unlink()
             out.replace(backup)
         tmp.replace(out)
     except Exception as e:
