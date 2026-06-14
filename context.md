@@ -419,6 +419,29 @@ Run in this order:
 - [ ] Scenario 6: Data type consistency
 - [ ] Scenario 7: Error handling
 
+### Unit Tests
+
+**Date:** 2026-06-14  
+**Result:** ✅ **All 26 tests PASSED**
+
+Comprehensive unit test suite verifies all critical fixes from commit 4fc0f0e:
+
+| Test Category | Count | Status |
+|---------------|-------|--------|
+| Fingerprinting (stability, precision) | 2 | ✅ PASSED |
+| Account extraction (centralized, case-insensitive) | 5 | ✅ PASSED |
+| Merchant key normalization | 3 | ✅ PASSED |
+| Date parsing (dayfirst, junk rejection) | 4 | ✅ PASSED |
+| Data type consistency (mixed-dtype concat) | 2 | ✅ PASSED |
+| Merge alignment (on TransactionId) | 1 | ✅ PASSED |
+| Categorization confidence levels | 3 | ✅ PASSED |
+| Sign handling (pre-negated amounts) | 1 | ✅ PASSED |
+| Encoding control (UTF-8) | 1 | ✅ PASSED |
+| Validation (column count, required columns) | 2 | ✅ PASSED |
+| Reversal handling (tolerance, reason preservation) | 2 | ✅ PASSED |
+
+**Verification:** All 23 bugs fixed in commit 4fc0f0e are covered and confirmed working.
+
 ### Regression Tests
 
 After any future refactors:
