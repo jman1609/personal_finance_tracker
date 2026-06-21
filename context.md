@@ -218,11 +218,11 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 5. **Backup retention policy** — keep only 1 backup per file (delete old before creating new)
 6. **Completed all 7 test scenarios** — Scenarios 4, 6, 7 passed; re-ingested fresh (0 blank dates, 2285 rows)
 
-### 2026-06-21 — PaymentMode, Categorization, Schema, TxnNote, Recategorize
+### 2026-06-21 — PaymentMode, Categorization, Schema, TxnNote, Recategorize, File Upload UI
 
 1. **Fixed PaymentMode extraction** — replaced naive dash-split with `detect_payment_mode()` using keyword/regex rules. Now correctly identifies 23 distinct modes (UPI, ACH C/D, NEFT CR/DR, RTGS CR/DR, DEBIT CARD SI, AUTOPAY, POS, FUND TRANSFER, etc.)
 
-2. **Expanded category_mapping.json** — 17 → 35 rules. Added: Zerodha, Grip Broking, Wint Wealth, BSE India, FD Open/Maturity, FD Interest, Credit Card Autopay, Airtel broadband, Apollo/Akash Pharmacy, BigBasket, Audible, Claude.ai, PlayStation, Google Cloud, Bank Charges, Forex transfers, Internal transfers, ACH C → Dividend Income.
+2. **Expanded category_mapping.json** — 17 → 35 rules. Added: Zerodha, Grip Broking, Wint Wealth, BSE India, FD Open/Maturity, FD Interest, Credit Card Autopay (→ Internal Transfer), Airtel broadband, Apollo/Akash Pharmacy, BigBasket, Audible, Claude.ai, PlayStation, Google Cloud, Bank Charges, Forex transfers, Internal transfers, ACH C → Dividend Income.
 
 3. **Schema cleanup in enriched_ledger** — removed `PostedDate` (always blank), `StatementPeriodStart`, `StatementPeriodEnd` (per-file metadata, not per-row).
 
@@ -230,7 +230,13 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 
 5. **Added `--recategorize` mode** — `rebuild_enriched_ledger()` reads master_ledger + uploaded_files, re-runs enrichment + categorization, rewrites enriched_ledger. No XLS parsing. Designed as the function the UI will call when user updates category rules.
 
-6. **Re-ingested all 3 files** — 2285 rows, 0 blank dates, sum ₹661,855.55, all verified.
+6. **Folder structure refactor** — `expenses/db/` → `expenses/data/db/`. All data now under `expenses/data/` (raw/, db/). Removed `processed/` and `samples/` folders; Excel report output removed entirely (enriched_ledger.csv + dashboard replace it).
+
+7. **Extracted `ingest_statement()`** — ingestion logic pulled out of `main()` into a callable function (same pattern as `rebuild_enriched_ledger()`). UI calls this directly; no subprocess needed. Accepts optional `original_filename` param so UI can preserve real filename instead of temp path.
+
+8. **Built file upload UI** — new "Upload Statement" tab in dashboard with institution/source-type dropdowns, file uploader, ingestion result metrics (rows parsed/added/duplicates/master total). "Ingestion History" tab shows uploaded_files.csv. Dashboard improvements: account filter, exclude internal transfers toggle, reversal-aware data, TxnNote + PaymentMode + CounterpartyGuess in Details tab.
+
+9. **Ingested 4th statement** — Acct 0683, 2022-01-01 to 2023-01-01, 1201 rows, 0 duplicates. Master ledger now 3486 rows.
 
 ---
 
@@ -244,30 +250,53 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 - Critical date corruption fix (dayfirst double-parse)
 - Date format auto-detection
 - Backup retention (keep latest only)
-- Streamlit dashboard (`expenses/ui/dashboard.py`)
 - PaymentMode detection overhaul (23 modes, keyword/regex)
-- Category mapping expanded (35 rules)
+- Category mapping expanded (35 rules); CC autopay → Internal Transfer
 - Schema cleanup (PostedDate / StatementPeriod removed from enriched)
 - TxnNote field (UPI free-text note)
 - `--recategorize` / `rebuild_enriched_ledger()` for UI use
+- `ingest_statement()` extracted as callable function
+- Folder structure: `expenses/db/` → `expenses/data/db/`; removed processed/ and Excel output
+- Streamlit dashboard with Upload Statement tab, Ingestion History tab, account filter, exclude-internals toggle
 
 ### ⏳ Next (In Priority Order)
-1. **Improve categorization coverage** — 1172/2285 (51%) still Uncategorized. Mostly UPI outflows. Group by `CounterpartyGuess` to find repeated merchants, add rules to `category_mapping.json`.
-2. **UI: Category Rule Manager** — see UI Roadmap below.
-3. **Credit card statement integration** — Jay to provide real HDFC CC statement. `detect_date_format()` should handle different date formats automatically; column layout may need parser adjustments.
-4. **Merge bank + CC data** — single dashboard view (depends on #3).
-5. **Medium priority** — transaction validation pre-write; persist reversal fields if needed for UI.
+1. **Fix dashboard spend KPI** — currently counts Investments, Transfers, NEFT as "spend", inflating total to ₹10.2cr. Need to split into "Lifestyle Spend" (Food/Transport/Entertainment/etc.) vs "Total Outflow". See Known Issues below.
+2. **Improve categorization coverage** — 1707/3486 (49%) Uncategorized. Mostly UPI outflows. Group by `CounterpartyGuess` to find repeated merchants, add rules to `category_mapping.json`.
+3. **UI: Category Rule Manager** — see UI Roadmap below.
+4. **Credit card statement integration** — Jay to provide real HDFC CC statement. `detect_date_format()` should handle different date formats; column layout may need parser adjustments.
+5. **Merge bank + CC data** — single dashboard view (depends on #4).
+6. **Medium priority** — transaction validation pre-write; persist reversal fields if needed for UI.
 
 ---
 
 ## UI Roadmap
 
-**Current state:** Basic Streamlit dashboard at `expenses/ui/dashboard.py` — 4 tabs (category breakdown, monthly trends, top merchants, transaction table), date + category filters, KPI cards.
+**Current state:** Streamlit dashboard at `expenses/ui/dashboard.py` with 3 top-level tabs:
+- **Dashboard** — category breakdown, monthly trends, top merchants, transaction details. Filters: account, date range, category, exclude-internals toggle. KPIs: total spend, income, net flow, transaction count.
+- **Upload Statement** — file uploader with institution/source-type dropdowns; shows rows parsed/added/duplicates after ingestion.
+- **Ingestion History** — table of all uploaded files from `uploaded_files.csv`.
 
 **Backend hooks already in place:**
+- `ingest_statement(path, institution, source_type, original_filename)` — callable from UI, returns result dict
 - `rebuild_enriched_ledger()` — call this when user updates rules; no re-ingestion needed
 - `category_overrides.csv` schema exists (not yet populated by code)
 - All derived fields (PaymentMode, CounterpartyGuess, TxnNote, IsReversal, NeedsReview, ReviewReason) are in enriched_ledger
+
+### 🔴 Known Dashboard Bug: Spend KPI Inflation
+**Problem:** "Total Spend" KPI sums all outflows including Investments (₹44.4L), large NEFT transfers, Uncategorized UPI bulk transfers — giving ₹10.2cr which is meaningless.
+
+**Root cause:** Dashboard filters on `SignedAmount < 0` but doesn't exclude non-lifestyle categories.
+
+**Fix needed:**
+- Define "Lifestyle Spend" = outflows excluding: Investments, Transfers, Internal Transfer, Financial, Uncategorized (or show Uncategorized separately)
+- Keep "Total Outflow" as a secondary metric for completeness
+- Once categorization improves, Uncategorized will shrink and numbers will be more meaningful
+
+**Spend breakdown as of 2026-06-21 (for reference):**
+- Lifestyle spend (Food + Transport + Entertainment + Shopping + Software + Travel + Groceries + Health + Bills): ~₹2.4L over 4 years
+- Investments outflow: ₹44.4L (Groww SIPs, Zerodha, Grip Broking)
+- Internal/Transfers: ₹12.4L (own-account moves, CC autopay)
+- Uncategorized outflow: ₹50.7L (mostly UPI — real split unknown until categorized)
 
 ### Priority 1: Category Rule Manager
 **Goal:** Let user update categorization rules without editing JSON manually.
@@ -289,14 +318,11 @@ Missing from current dashboard:
 - **TxnNote column** in transaction details table
 - **PaymentMode breakdown** — chart showing spend split by UPI / ACH / NEFT / POS etc.
 
-### Priority 3: File Ingestion
-**Goal:** Move away from CLI; user uploads files from the UI.
-
-- File upload widget (.xls/.xlsx)
-- Institution dropdown (HDFC, ICICI, etc.)
-- Source Type dropdown (Bank Account, Credit Card)
-- Triggers ingestion pipeline, shows result: rows parsed / added / skipped
-- Upload history table from `uploaded_files.csv`
+### Priority 3: File Ingestion ✅ DONE
+- File upload widget (.xls/.xlsx) ✅
+- Institution + Source Type dropdowns ✅
+- Ingestion result metrics (rows parsed/added/duplicates/master total) ✅
+- Upload history tab (uploaded_files.csv) ✅
 
 ### Priority 4: Review Queue
 **Goal:** Surface transactions that need manual attention.
@@ -316,10 +342,14 @@ Missing from current dashboard:
 ---
 
 ## Current Data State (as of 2026-06-21)
-- `master_ledger.csv`: 2285 rows, 0 blank dates
-- `enriched_ledger.csv`: 2285 rows, 14 IsReversal=1 (7 pairs), 1172 Uncategorized (51%)
-- Sum(SignedAmount): ₹661,855.55 (reconciled master ↔ enriched)
-- 3 source files: Acct 0112 (250 rows), Acct 0683 two statements (1240 + 795 new after dedup)
+- `master_ledger.csv`: 3486 rows, 0 blank dates
+- `enriched_ledger.csv`: 3486 rows, 1707 Uncategorized (49%)
+- Sum(SignedAmount): ₹692,152.31
+- 4 source files:
+  - Acct 0112: 250 rows (2025-12-11 to 2026-06-05)
+  - Acct 0683: 1240 rows (2025-07-01 to 2026-06-04)
+  - Acct 0683: 795 new rows after dedup (2025-01-01 to 2026-01-01)
+  - Acct 0683: 1201 rows (2022-01-01 to 2023-01-01) ← ingested via UI
 - `expenses/data/db/`: exactly 1 backup file per CSV
 
 ---

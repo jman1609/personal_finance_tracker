@@ -971,6 +971,87 @@ def rebuild_enriched_ledger() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ingest statement (UI + CLI entry point)
+# ---------------------------------------------------------------------------
+
+def ingest_statement(input_path: str, institution: str, source_type: str,
+                     original_filename: str = None) -> dict:
+    """Parse and ingest a single statement file into the ledger.
+
+    Returns a result dict with keys: skipped (bool), rows_parsed, rows_added,
+    rows_skipped, master_total, uncategorized, filename.
+    Raises ValueError or FileNotFoundError on bad input.
+    This is what the UI calls on file upload.
+    """
+    original_filename = original_filename or Path(input_path).name
+    file_hash = compute_file_hash(input_path)
+
+    uploaded_file = Path(UPLOADED_FILES_PATH)
+    if uploaded_file.exists() and uploaded_file.stat().st_size > 0:
+        existing_uploads = pd.read_csv(uploaded_file, dtype=str, encoding='utf-8')
+        duplicate = existing_uploads[
+            (existing_uploads["FileHash"] == file_hash) &
+            (existing_uploads["ParsedStatus"] == "PARSED")
+        ]
+        if not duplicate.empty:
+            return {"skipped": True, "filename": original_filename, "reason": "already_processed"}
+
+    source_file_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+
+    tx_new, statement_meta = parse_statement(input_path, source_file_id, institution, source_type)
+    rows_parsed = len(tx_new)
+
+    tx_master, rows_added, rows_skipped = update_master_ledger(MASTER_LEDGER_PATH, tx_new)
+
+    append_uploaded_file_row(
+        source_file_id=source_file_id,
+        original_filename=original_filename,
+        input_path=input_path,
+        source_type=source_type,
+        institution=institution,
+        statement_metadata=statement_meta,
+        rows_parsed=rows_parsed,
+        rows_added=rows_added,
+    )
+
+    append_ingestion_run_row(
+        run_id=run_id,
+        source_file_id=source_file_id,
+        rows_parsed=rows_parsed,
+        rows_added=rows_added,
+        rows_skipped=rows_skipped,
+    )
+
+    if tx_master.empty:
+        raise ValueError("No transactions in master ledger.")
+
+    rules = load_mapping(MAPPING_PATH)
+    enriched = enrich_master_ledger(tx_master)
+    categorized = categorize_with_mapping(enriched, rules)
+    categorized = detect_reversal_pairs(categorized)
+
+    write_enriched_ledger(
+        categorized_df=categorized,
+        source_file_id=source_file_id,
+        source_type=source_type,
+        institution=institution,
+        original_filename=original_filename,
+        statement_metadata=statement_meta,
+    )
+
+    return {
+        "skipped": False,
+        "filename": original_filename,
+        "rows_parsed": rows_parsed,
+        "rows_added": rows_added,
+        "rows_skipped": rows_skipped,
+        "master_total": len(tx_master),
+        "uncategorized": int((categorized["Category"] == "Uncategorized").sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -990,78 +1071,19 @@ def main():
     if not args.input or not args.institution or not args.source_type:
         parser.error("--input, --institution, and --source-type are required when not using --recategorize")
 
-    original_filename = Path(args.input).name
-    file_hash = compute_file_hash(args.input)
+    result = ingest_statement(args.input, args.institution, args.source_type)
 
-    uploaded_file = Path(UPLOADED_FILES_PATH)
-    if uploaded_file.exists() and uploaded_file.stat().st_size > 0:
-        existing_uploads = pd.read_csv(uploaded_file, dtype=str, encoding='utf-8')
-        duplicate = existing_uploads[
-            (existing_uploads["FileHash"] == file_hash) &
-            (existing_uploads["ParsedStatus"] == "PARSED")
-        ]
-        if not duplicate.empty:
-            print(f"File already processed: {original_filename} (hash: {file_hash[:16]}...)")
-            print(f"Skipping re-ingestion.")
-            return
+    if result["skipped"]:
+        print(f"File already processed: {result['filename']}. Skipping re-ingestion.")
+        return
 
-    source_file_id = str(uuid.uuid4())
-    run_id = str(uuid.uuid4())
-
-    print(f"Parsing: {args.input}")
-    tx_new, statement_meta = parse_statement(args.input, source_file_id, args.institution, args.source_type)
-    rows_parsed = len(tx_new)
-    print(f"Parsed rows: {rows_parsed}")
-
-    tx_master, rows_added, rows_skipped = update_master_ledger(MASTER_LEDGER_PATH, tx_new)
-    print(f"Rows added to master ledger: {rows_added}")
-    print(f"Rows skipped (duplicates): {rows_skipped}")
-    print(f"Master ledger total: {len(tx_master)}")
-
-    # Record file upload metadata
-    append_uploaded_file_row(
-        source_file_id=source_file_id,
-        original_filename=original_filename,
-        input_path=args.input,
-        source_type=args.source_type,
-        institution=args.institution,
-        statement_metadata=statement_meta,
-        rows_parsed=rows_parsed,
-        rows_added=rows_added,
-    )
-    print(f"Recorded in uploaded_files.csv")
-
-    # Record ingestion run stats
-    append_ingestion_run_row(
-        run_id=run_id,
-        source_file_id=source_file_id,
-        rows_parsed=rows_parsed,
-        rows_added=rows_added,
-        rows_skipped=rows_skipped,
-    )
-    print(f"Recorded in ingestion_runs.csv")
-
-    if tx_master.empty:
-        raise ValueError("No transactions in master ledger.")
-
-    rules = load_mapping(MAPPING_PATH)
-    enriched = enrich_master_ledger(tx_master)
-    categorized = categorize_with_mapping(enriched, rules)
-    categorized = detect_reversal_pairs(categorized)
-
-    # Write enriched ledger (denormalized view with all metadata + categorization)
-    write_enriched_ledger(
-        categorized_df=categorized,
-        source_file_id=source_file_id,
-        source_type=args.source_type,
-        institution=args.institution,
-        original_filename=original_filename,
-        statement_metadata=statement_meta,
-    )
-    print(f"Recorded in enriched_ledger.csv")
-
-    print(f"Done. Rows processed: {len(categorized)}")
-    print(f"Uncategorized: {int((categorized['Category'] == 'Uncategorized').sum())}")
+    print(f"Parsed rows: {result['rows_parsed']}")
+    print(f"Rows added to master ledger: {result['rows_added']}")
+    print(f"Rows skipped (duplicates): {result['rows_skipped']}")
+    print(f"Master ledger total: {result['master_total']}")
+    print(f"Recorded in uploaded_files.csv, ingestion_runs.csv, enriched_ledger.csv")
+    print(f"Done. Rows processed: {result['rows_parsed']}")
+    print(f"Uncategorized: {result['uncategorized']}")
 
 
 if __name__ == "__main__":
