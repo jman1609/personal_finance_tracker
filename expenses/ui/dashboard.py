@@ -57,7 +57,15 @@ with tab_upload:
             try:
                 result = ingest_statement(tmp_path, institution, source_type,
                                           original_filename=original_name)
-                Path(tmp_path).unlink(missing_ok=True)
+
+                # Save a copy to raw/ before deleting the temp file
+                raw_dir = Path("expenses/data/raw")
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                raw_dest = raw_dir / original_name
+                if not raw_dest.exists():
+                    Path(tmp_path).rename(raw_dest)
+                else:
+                    Path(tmp_path).unlink(missing_ok=True)
 
                 if result["skipped"]:
                     st.warning(f"**{result['filename']}** has already been processed. Skipping.")
