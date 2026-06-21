@@ -78,7 +78,6 @@ ENRICHED_LEDGER_COLUMNS = [
     "TransactionId",
     "SourceFileId",
     "Date",
-    "PostedDate",
     "DescriptionRaw",
     "DescriptionNormalized",
     "ReferenceNumber",
@@ -92,8 +91,6 @@ ENRICHED_LEDGER_COLUMNS = [
     "SourceType",
     "Institution",
     "AccountOrCardLast4",
-    "StatementPeriodStart",
-    "StatementPeriodEnd",
     "SourceFileName",
     # Derived transaction attributes
     "Flow",
@@ -101,6 +98,7 @@ ENRICHED_LEDGER_COLUMNS = [
     "CounterpartyGuess",
     "UPIHandle",
     "TxnIdGuess",
+    "TxnNote",
     # Categorization
     "Category",
     "Subcategory",
@@ -650,7 +648,7 @@ def write_enriched_ledger(
     if pd.api.types.is_datetime64_any_dtype(merged["Date"]):
         merged["Date"] = merged["Date"].dt.strftime("%Y-%m-%d")
 
-    categorization_cols = ["TransactionId", "Category", "Subcategory", "Merchant", "MatchedPattern", "NeedsReview", "ReviewReason", "IsReversal", "ReversalGroupId", "Flow", "PaymentMode", "CounterpartyGuess", "UPIHandle", "TxnIdGuess"]
+    categorization_cols = ["TransactionId", "Category", "Subcategory", "Merchant", "MatchedPattern", "NeedsReview", "ReviewReason", "IsReversal", "ReversalGroupId", "Flow", "PaymentMode", "CounterpartyGuess", "UPIHandle", "TxnIdGuess", "TxnNote"]
     categorized_for_merge = categorized_df[categorization_cols].copy()
 
     merged = merged.merge(categorized_for_merge, on="TransactionId", how="left")
@@ -704,16 +702,90 @@ def enrich_master_ledger(master_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def detect_payment_mode(text: str) -> str:
+    """Detect payment mode from narration using keyword rules."""
+    t = text.upper()
+    if t.startswith("UPI-") or t.startswith("REV-UPI-"):
+        return "UPI"
+    if t.startswith("ACH C-") or t.startswith("ACH C "):
+        return "ACH C"
+    if t.startswith("ACH D-") or t.startswith("ACH D "):
+        return "ACH D"
+    if "NEFT CR" in t:
+        return "NEFT CR"
+    if "NEFT DR" in t:
+        return "NEFT DR"
+    if "RTGS CR" in t:
+        return "RTGS CR"
+    if "RTGS DR" in t:
+        return "RTGS DR"
+    if t.startswith("IMPS"):
+        return "IMPS"
+    if t.startswith("POS ") or t.startswith("CRV POS "):
+        return "POS"
+    if "NET BANKING SI" in t:
+        return "NET BANKING SI"
+    if t.startswith("ME DC SI ") or t.startswith("DC SI "):
+        return "DEBIT CARD SI"
+    if ".DC INTL POS TXN" in t:
+        return "DEBIT CARD INTL"
+    if "AUTOPAY SI" in t:
+        return "AUTOPAY"
+    if t.startswith("FT-") or "IB FUNDS TRANSFER" in t:
+        return "FUND TRANSFER"
+    if t.startswith("IB BILLPAY"):
+        return "BILL PAYMENT"
+    if t.startswith("FD THROUGH DIGITAL") or t.startswith("IB FD"):
+        return "FIXED DEPOSIT"
+    if t.startswith("NWD"):
+        return "ATM WITHDRAWAL"
+    if t.startswith("REV-"):
+        return "REVERSAL"
+    if t.startswith("RFX "):
+        return "FOREX TRANSFER"
+    if "INTEREST PAID" in t or "QUARTERLY INTEREST" in t:
+        return "INTEREST"
+    if t.startswith("TAX RECOVERY") or t.startswith("CBDT/"):
+        return "TAX"
+    if t.startswith("LOCKER RENT"):
+        return "BANK CHARGES"
+    # fallback: first dash-segment if short and alpha
+    parts = [p.strip() for p in text.split("-") if p.strip()]
+    first = parts[0].upper() if parts else ""
+    if first and len(first) <= 12 and re.match(r"^[A-Z0-9 ]+$", first):
+        return first
+    return "OTHER"
+
+
 def extract_narration_features(narration: str) -> dict:
     text = (narration or "").strip()
-    parts = [p.strip() for p in text.split("-") if p.strip()]
     upi_match = re.search(r"([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)", text)
     txn_match = re.search(r"\b(\d{10,20})\b", text)
+
+    payment_mode = detect_payment_mode(text)
+
+    counterparty = ""
+    txn_note = ""
+    if payment_mode == "UPI":
+        # Format: UPI-<NAME>-<handle@bank>-<IFSC>-<TxnId>-<FreeText note>
+        parts = [p.strip() for p in text.split("-") if p.strip()]
+        counterparty = parts[1] if len(parts) > 1 else ""
+        # Last segment is free-text note if it's not a UPI handle / numeric txn id / IFSC
+        if len(parts) >= 6:
+            candidate = parts[-1]
+            is_numeric = re.match(r"^\d+$", candidate)
+            is_handle = "@" in candidate
+            is_ifsc = re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", candidate)
+            is_mode_tag = candidate.upper() in {"UPI", "IMPS", "NEFT"}
+            if not is_numeric and not is_handle and not is_ifsc and not is_mode_tag:
+                txn_note = candidate
+
     return {
-        "PaymentMode": parts[0].upper() if parts else "OTHER",
-        "CounterpartyGuess": parts[1] if len(parts) > 1 else "",
+        "PaymentMode": payment_mode,
+        "CounterpartyGuess": counterparty,
         "UPIHandle": upi_match.group(1) if upi_match else "",
         "TxnIdGuess": txn_match.group(1) if txn_match else "",
+        "TxnNote": txn_note,
     }
 
 
@@ -806,7 +878,7 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
     work = work.sort_values(["MerchantKey", "_abs_amount", "Date", "_row_pos"]).reset_index(drop=True)
     used: set = set()
 
-    for _key, g in work[work["MerchantKey"].str.strip() != ""].groupby("MerchantKey", sort=False):
+    for _, g in work[work["MerchantKey"].str.strip() != ""].groupby("MerchantKey", sort=False):
         if len(g) < 2:
             continue
         rows = g.to_dict("records")
@@ -886,15 +958,73 @@ def save_outputs(categorized: pd.DataFrame, summary: pd.DataFrame, output_path: 
 
 
 # ---------------------------------------------------------------------------
+# Recategorize (UI entry point)
+# ---------------------------------------------------------------------------
+
+def rebuild_enriched_ledger() -> None:
+    """Re-run enrichment + categorization over the existing master_ledger.
+
+    Reads master_ledger.csv and uploaded_files.csv, re-applies all enrichment
+    and category_mapping.json rules, then rewrites enriched_ledger.csv.
+    Does not touch master_ledger or ingest any new files.
+
+    This is the function the UI calls when the user updates category rules
+    and clicks 'Refresh Categorization'.
+    """
+    master_file = Path(MASTER_LEDGER_PATH)
+    if not master_file.exists() or master_file.stat().st_size == 0:
+        raise ValueError(f"master_ledger.csv not found or empty: {MASTER_LEDGER_PATH}")
+
+    master = pd.read_csv(master_file, dtype=str, encoding='utf-8').fillna("")
+    if master.empty:
+        raise ValueError("master_ledger.csv has no rows to categorize.")
+
+    print(f"Loaded {len(master)} rows from master_ledger.csv")
+
+    if "Date" in master.columns:
+        master["Date"] = parse_date_series(master["Date"])
+    for col in ["WithdrawalAmount", "DepositAmount", "SignedAmount"]:
+        if col in master.columns:
+            master[col] = pd.to_numeric(master[col], errors="coerce").fillna(0.0)
+
+    rules = load_mapping(MAPPING_PATH)
+    enriched = enrich_master_ledger(master)
+    categorized = categorize_with_mapping(enriched, rules)
+    categorized = detect_reversal_pairs(categorized)
+
+    write_enriched_ledger(
+        categorized_df=categorized,
+        source_file_id="",
+        source_type="",
+        institution="",
+        original_filename="",
+        statement_metadata={},
+    )
+
+    uncategorized = int((categorized["Category"] == "Uncategorized").sum())
+    print(f"Enriched ledger rebuilt: {len(categorized)} rows")
+    print(f"Uncategorized: {uncategorized} ({uncategorized / len(categorized) * 100:.1f}%)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Categorize bank statement transactions.")
-    parser.add_argument("--input", required=True, help="Path to a single statement file (.xls/.xlsx)")
-    parser.add_argument("--institution", required=True, help="Institution name (e.g., HDFC, ICICI)")
-    parser.add_argument("--source-type", required=True, help="Source type (e.g., Bank Account, Credit Card)")
+    parser.add_argument("--input", help="Path to a single statement file (.xls/.xlsx)")
+    parser.add_argument("--institution", help="Institution name (e.g., HDFC, ICICI)")
+    parser.add_argument("--source-type", help="Source type (e.g., Bank Account, Credit Card)")
+    parser.add_argument("--recategorize", action="store_true",
+                        help="Re-run categorization over existing master_ledger (no new file needed)")
     args = parser.parse_args()
+
+    if args.recategorize:
+        rebuild_enriched_ledger()
+        return
+
+    if not args.input or not args.institution or not args.source_type:
+        parser.error("--input, --institution, and --source-type are required when not using --recategorize")
 
     original_filename = Path(args.input).name
     file_hash = compute_file_hash(args.input)

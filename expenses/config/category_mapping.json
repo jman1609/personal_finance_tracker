@@ -6,19 +6,58 @@
     {"pattern": "OLA", "category": "Transport", "subcategory": "Taxi", "merchant": "Ola"},
     {"pattern": "AMAZON", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Amazon"},
     {"pattern": "FLIPKART", "category": "Shopping", "subcategory": "Online Shopping", "merchant": "Flipkart"},
-    {"pattern": "GROWW", "category": "Investments", "subcategory": "Mutual Funds", "merchant": "Groww"},
+    {"pattern": "GROWW", "category": "Investments", "subcategory": "Mutual Funds / SIP", "merchant": "Groww"},
+    {"pattern": "ZERODHA", "category": "Investments", "subcategory": "Stocks", "merchant": "Zerodha"},
+    {"pattern": "CSHFREGRIPBROKINGPRI", "category": "Investments", "subcategory": "Bonds", "merchant": "Grip Broking"},
     {"pattern": "PAYTM", "category": "Transfers", "subcategory": "Wallet", "merchant": "Paytm"},
 
     {"pattern": "SPOTIFY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Spotify"},
     {"pattern": "NETFLIX", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Netflix"},
     {"pattern": "GOOGLE PLAY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Google Play"},
     {"pattern": "GOOGLEPLAY", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Google Play"},
+    {"pattern": "GOOGLE CLOUD", "category": "Software", "subcategory": "Subscriptions", "merchant": "Google Cloud"},
     {"pattern": "APPLE MEDIA SERVICES", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Apple Media Services"},
+    {"pattern": "AUDIBLE", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "Amazon Audible"},
+    {"pattern": "PLAYSTATION", "category": "Entertainment", "subcategory": "Subscriptions", "merchant": "PlayStation"},
+    {"pattern": "CLAUDE.AI", "category": "Software", "subcategory": "Subscriptions", "merchant": "Claude.ai"},
 
     {"pattern": "IND*MICROSOFT", "category": "Software", "subcategory": "Subscriptions", "merchant": "Microsoft"},
     {"pattern": "MICROSOFT", "category": "Software", "subcategory": "Subscriptions", "merchant": "Microsoft"},
 
     {"pattern": "AGODA", "category": "Travel", "subcategory": "Hotel", "merchant": "Agoda"},
-    {"pattern": "BLINKIT", "category": "Groceries", "subcategory": "Instant Delivery", "merchant": "Blinkit"}
+    {"pattern": "BLINKIT", "category": "Groceries", "subcategory": "Instant Delivery", "merchant": "Blinkit"},
+    {"pattern": "BIGBASKET", "category": "Groceries", "subcategory": "Online Grocery", "merchant": "BigBasket"},
+
+    {"pattern": "AIRTEL LANDLINE BILL", "category": "Bills", "subcategory": "Broadband / Internet", "merchant": "Airtel"},
+    {"pattern": "AIRTEL BROADBANDBIL", "category": "Bills", "subcategory": "Broadband / Internet", "merchant": "Airtel"},
+    {"pattern": "AIRTELBROADBANDBIL", "category": "Bills", "subcategory": "Broadband / Internet", "merchant": "Airtel"},
+    {"pattern": "AIRTEL PAYMENTS BANK", "category": "Bills", "subcategory": "Broadband / Internet", "merchant": "Airtel"},
+    {"pattern": "AIRTELBILLPAYMENTS", "category": "Bills", "subcategory": "Broadband / Internet", "merchant": "Airtel"},
+
+    {"pattern": "APOLLO PHARMAC", "category": "Health", "subcategory": "Pharmacy", "merchant": "Apollo Pharmacy"},
+    {"pattern": "APOLLO PHARMACY", "category": "Health", "subcategory": "Pharmacy", "merchant": "Apollo Pharmacy"},
+    {"pattern": "AKASH PHARMACY", "category": "Health", "subcategory": "Pharmacy", "merchant": "Akash Pharmacy"},
+
+    {"pattern": "AUTOPAY SI", "category": "Financial", "subcategory": "Credit Card Payment", "merchant": ""},
+    {"pattern": "IB BILLPAY", "category": "Bills", "subcategory": "Bill Payment", "merchant": ""},
+
+    {"pattern": "LOCKER RENT", "category": "Financial", "subcategory": "Bank Charges", "merchant": "HDFC Bank"},
+    {"pattern": "TAX RECOVERY", "category": "Financial", "subcategory": "TDS / Tax", "merchant": ""},
+    {"pattern": "CBDT/", "category": "Financial", "subcategory": "Income Tax", "merchant": ""},
+    {"pattern": "DC INTL POS TXN MARKUP", "category": "Financial", "subcategory": "Bank Charges", "merchant": "HDFC Bank"},
+
+    {"pattern": "IB FD PREMAT", "category": "Investments", "subcategory": "Fixed Deposit", "merchant": "HDFC Bank"},
+    {"pattern": "FD THROUGH DIGITAL", "category": "Investments", "subcategory": "Fixed Deposit", "merchant": "HDFC Bank"},
+    {"pattern": "QUARTERLY INTEREST CREDIT", "category": "Income", "subcategory": "FD Interest", "merchant": "HDFC Bank"},
+    {"pattern": "INTEREST PAID TILL", "category": "Income", "subcategory": "FD Interest", "merchant": "HDFC Bank"},
+
+    {"pattern": "RFX ", "category": "Financial", "subcategory": "Forex / Wire Transfer", "merchant": ""},
+
+    {"pattern": "ACH C", "category": "Income", "subcategory": "Dividend Income", "merchant": ""},
+
+    {"pattern": "NET BANKING SI", "category": "Internal Transfer", "subcategory": "Own Account Transfer", "merchant": "HDFC Bank"},
+
+    {"pattern": "RAZPWINTWEALTH", "category": "Investments", "subcategory": "Bonds / Wealth Platform", "merchant": "Wint Wealth"},
+    {"pattern": "RAZPBSEINDIACOM", "category": "Investments", "subcategory": "Stocks / BSE", "merchant": "BSE India"}
   ]
 }
