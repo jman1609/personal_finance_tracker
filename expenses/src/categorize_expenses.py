@@ -16,8 +16,6 @@ MASTER_LEDGER_PATH = "expenses/data/db/master_ledger.csv"
 UPLOADED_FILES_PATH = "expenses/data/db/uploaded_files.csv"
 INGESTION_RUNS_PATH = "expenses/data/db/ingestion_runs.csv"
 ENRICHED_LEDGER_PATH = "expenses/data/db/enriched_ledger.csv"
-OUTPUT_PATH = "expenses/data/processed/categorized_transactions.xlsx"
-SUMMARY_PATH = "expenses/data/processed/category_summary.xlsx"
 
 # --- HDFC-specific parser constants ---
 HDFC_HEADER_KEYWORDS = [
@@ -923,40 +921,6 @@ def detect_reversal_pairs(df: pd.DataFrame, day_window: int = 7, amount_toleranc
 # Summary and output
 # ---------------------------------------------------------------------------
 
-def create_summary(df: pd.DataFrame) -> pd.DataFrame:
-    is_rev = df.get("IsReversal", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    spend = df[(df["SignedAmount"] < 0) & (~is_rev)].copy()
-    spend["Expense"] = spend["SignedAmount"].abs()
-    return (
-        spend.groupby(["Month", "Category", "Subcategory"], dropna=False, as_index=False)["Expense"]
-        .sum()
-        .sort_values(["Month", "Expense"], ascending=[True, False])
-    )
-
-
-def save_outputs(categorized: pd.DataFrame, summary: pd.DataFrame, output_path: str, summary_path: str):
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        categorized.to_excel(writer, index=False, sheet_name="transactions")
-        categorized[categorized["NeedsReview"]].to_excel(writer, index=False, sheet_name="review_queue")
-        is_rev = categorized.get("IsReversal", pd.Series(False, index=categorized.index)).fillna(False).astype(bool)
-        categorized[is_rev].to_excel(writer, index=False, sheet_name="reversal_candidates")
-        pd.DataFrame({
-            "total_rows": [len(categorized)],
-            "uncategorized_rows": [int((categorized["Category"] == "Uncategorized").sum())],
-            "coverage_pct": [
-                round(100.0 * (1.0 - (categorized["Category"] == "Uncategorized").mean()), 2)
-                if len(categorized) else 0.0
-            ],
-            "needs_review_rows": [int(categorized["NeedsReview"].sum())],
-            "reversal_rows": [int(categorized.get("IsReversal", pd.Series(False)).sum())],
-        }).to_excel(writer, index=False, sheet_name="qa_summary")
-
-    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
-    summary.to_excel(summary_path, index=False)
-
-
 # ---------------------------------------------------------------------------
 # Recategorize (UI entry point)
 # ---------------------------------------------------------------------------
@@ -1096,13 +1060,8 @@ def main():
     )
     print(f"Recorded in enriched_ledger.csv")
 
-    summary = create_summary(categorized)
-    save_outputs(categorized, summary, OUTPUT_PATH, SUMMARY_PATH)
-
     print(f"Done. Rows processed: {len(categorized)}")
     print(f"Uncategorized: {int((categorized['Category'] == 'Uncategorized').sum())}")
-    print(f"Output: {OUTPUT_PATH}")
-    print(f"Summary: {SUMMARY_PATH}")
 
 
 if __name__ == "__main__":

@@ -14,11 +14,9 @@ expense_venv/
 .env
 
 # Sensitive + generated data
-expenses/db/*
 expenses/data/db/*
 !expenses/data/db/.gitkeep
 expenses/data/raw/
-expenses/data/processed/
 investments/raw/
 investments/*
 !investments/.gitkeep
@@ -30,5 +28,3 @@ investments/raw/*
 data/raw/
 data/processed/
 
-# Optional sample data is safe to commit only if anonymized
-# expenses/data/samples/
