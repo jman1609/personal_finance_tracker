@@ -15,6 +15,8 @@ expense_venv/
 
 # Sensitive + generated data
 expenses/db/*
+expenses/data/db/*
+!expenses/data/db/.gitkeep
 expenses/data/raw/
 expenses/data/processed/
 investments/raw/

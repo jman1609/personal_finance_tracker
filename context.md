@@ -5,17 +5,17 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 
 ## Architecture Decisions
 
-- **No SQLite.** Use CSV/XLSX files in `expenses/db/` as the file-based database.
+- **No SQLite.** Use CSV/XLSX files in `expenses/data/db/` as the file-based database.
 - **Two-ledger model.** `master_ledger.csv` holds immutable core transaction data. `enriched_ledger.csv` is fully derived (categorization, review flags, reversal tags) and regenerated on each run.
 - **De-duplication is the sole responsibility of the process writing `master_ledger.csv`.** `enriched_ledger.csv` never de-dupes.
 - **`Institution` and `SourceType` come from UI input**, not inferred from statement content. Account/card last-4 is inferred by the parser as a hint only — never asked from the user directly.
 - **No complex per-bank format config files.** Parser stays simple and general; a lightweight pre-parsing heuristic can suggest column mappings in the UI later.
 - **Flexible Parser Framework deferred.** Nail the HDFC parser and core data model first; generalize later.
 - **`SignedAmount` kept** (`DepositAmount - WithdrawalAmount`). **`Currency` omitted** for now — all transactions assumed INR; add if multi-currency is ever needed.
-- **Safe writes everywhere.** All `expenses/db/` files use a `safe_replace_with_backup` pattern (`.backup` suffix) before any overwrite. Same applies to `expenses/config/category_mapping.json`.
+- **Safe writes everywhere.** All `expenses/data/db/` files use a `safe_replace_with_backup` pattern (`.backup` suffix) before any overwrite. Same applies to `expenses/config/category_mapping.json`.
 - **`rebuild_enriched_ledger()` is the UI entry point for re-categorization.** It reads master_ledger + uploaded_files, re-runs enrichment and categorization, and rewrites enriched_ledger.csv. No ingestion required. This is what the UI calls when a user updates category rules.
 
-## File-Based DB: `expenses/db/`
+## File-Based DB: `expenses/data/db/`
 
 | File | Purpose |
 |---|---|
@@ -27,7 +27,7 @@ Build a Git-ready Python project that reads bank/credit-card statements (CSV/XLS
 | `manual_reviews.csv` | Human review decisions |
 | `category_overrides.csv` | Transaction-level category corrections |
 
-`expenses/config/category_mapping.json` stays as JSON for now (may move to `expenses/db/category_rules.csv` once UI editing is in place).
+`expenses/config/category_mapping.json` stays as JSON for now (may move to `expenses/data/db/category_rules.csv` once UI editing is in place).
 
 ## Canonical Schema
 
@@ -72,7 +72,7 @@ Credit cards omit `ClosingBalance`.
 - Expense config: `expenses/config/`
 - Raw input files: `expenses/data/raw/YYYY-MM/` (gitignored)
 - Generated reports: `expenses/data/processed/` (gitignored)
-- File-based DB: `expenses/db/` (gitignored except `.gitkeep`)
+- File-based DB: `expenses/data/db/` (gitignored except `.gitkeep`)
 - Investment files: `investments/`
 
 ## Expected Inputs
@@ -104,15 +104,15 @@ python expenses/src/categorize_expenses.py --recategorize
 Reads `master_ledger.csv` + `uploaded_files.csv`, re-runs enrichment and categorization using the current `category_mapping.json`, rewrites `enriched_ledger.csv`. Use this after updating category rules without ingesting a new file. This is the function the UI will call when the user clicks "Refresh Categorization".
 
 **Output files created/updated (ingestion mode):**
-- `expenses/db/master_ledger.csv` (core transactions, deduplicated)
-- `expenses/db/uploaded_files.csv` (one row per ingested file)
-- `expenses/db/ingestion_runs.csv` (one row per run)
-- `expenses/db/enriched_ledger.csv` (denormalized, categorized view)
+- `expenses/data/db/master_ledger.csv` (core transactions, deduplicated)
+- `expenses/data/db/uploaded_files.csv` (one row per ingested file)
+- `expenses/data/db/ingestion_runs.csv` (one row per run)
+- `expenses/data/db/enriched_ledger.csv` (denormalized, categorized view)
 - `expenses/data/processed/categorized_transactions.xlsx` (Excel workbook)
 - `expenses/data/processed/category_summary.xlsx` (summary by category/month)
 
 **Output files updated (recategorize mode):**
-- `expenses/db/enriched_ledger.csv` only
+- `expenses/data/db/enriched_ledger.csv` only
 
 ---
 
@@ -255,7 +255,7 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 1. **Improve categorization coverage** — 1172/2285 (51%) still Uncategorized. Mostly UPI outflows. Group by `CounterpartyGuess` to find repeated merchants, add rules to `category_mapping.json`.
 2. **Credit card statement integration** — Jay to provide real HDFC CC statement. `detect_date_format()` should handle different date formats automatically; column layout may need parser adjustments.
 3. **Merge bank + CC data** — single dashboard view (depends on #2).
-4. **Folder structure refactor** (optional, low priority) — consolidate `expenses/db/` → `expenses/data/db/`.
+4. **Folder structure refactor** (optional, low priority) — consolidate `expenses/data/db/` → `expenses/data/db/`.
 5. **Medium priority** — transaction validation pre-write; persist reversal fields if needed for UI.
 
 ---
@@ -265,12 +265,12 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 - `enriched_ledger.csv`: 2285 rows, 14 IsReversal=1 (7 pairs), 1172 Uncategorized (51%)
 - Sum(SignedAmount): ₹661,855.55 (reconciled master ↔ enriched)
 - 3 source files: Acct 0112 (250 rows), Acct 0683 two statements (1240 + 795 new after dedup)
-- `expenses/db/`: exactly 1 backup file per CSV
+- `expenses/data/db/`: exactly 1 backup file per CSV
 
 ---
 
 ## Security / Git Hygiene
-Never commit: real bank/credit-card statements, `.env`, generated outputs, virtual environments, `expenses/db/` data files.
+Never commit: real bank/credit-card statements, `.env`, generated outputs, virtual environments, `expenses/data/db/` data files.
 
 ---
 

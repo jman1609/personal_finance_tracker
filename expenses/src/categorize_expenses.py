@@ -12,10 +12,10 @@ import pandas as pd
 
 # --- Hardcoded internal paths ---
 MAPPING_PATH = "expenses/config/category_mapping.json"
-MASTER_LEDGER_PATH = "expenses/db/master_ledger.csv"
-UPLOADED_FILES_PATH = "expenses/db/uploaded_files.csv"
-INGESTION_RUNS_PATH = "expenses/db/ingestion_runs.csv"
-ENRICHED_LEDGER_PATH = "expenses/db/enriched_ledger.csv"
+MASTER_LEDGER_PATH = "expenses/data/db/master_ledger.csv"
+UPLOADED_FILES_PATH = "expenses/data/db/uploaded_files.csv"
+INGESTION_RUNS_PATH = "expenses/data/db/ingestion_runs.csv"
+ENRICHED_LEDGER_PATH = "expenses/data/db/enriched_ledger.csv"
 OUTPUT_PATH = "expenses/data/processed/categorized_transactions.xlsx"
 SUMMARY_PATH = "expenses/data/processed/category_summary.xlsx"
 

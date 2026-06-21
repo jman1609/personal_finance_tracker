@@ -11,7 +11,7 @@ st.title("📊 Personal Finance Dashboard")
 # Load data
 @st.cache_data
 def load_data():
-    return pd.read_csv("expenses/db/enriched_ledger.csv")
+    return pd.read_csv("expenses/data/db/enriched_ledger.csv")
 
 df = load_data()
 df["Date"] = pd.to_datetime(df["Date"])
