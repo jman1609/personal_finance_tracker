@@ -253,10 +253,65 @@ Rules are matched against `DescriptionNormalized` (case-insensitive substring ma
 
 ### ⏳ Next (In Priority Order)
 1. **Improve categorization coverage** — 1172/2285 (51%) still Uncategorized. Mostly UPI outflows. Group by `CounterpartyGuess` to find repeated merchants, add rules to `category_mapping.json`.
-2. **Credit card statement integration** — Jay to provide real HDFC CC statement. `detect_date_format()` should handle different date formats automatically; column layout may need parser adjustments.
-3. **Merge bank + CC data** — single dashboard view (depends on #2).
-4. **Folder structure refactor** (optional, low priority) — consolidate `expenses/data/db/` → `expenses/data/db/`.
+2. **UI: Category Rule Manager** — see UI Roadmap below.
+3. **Credit card statement integration** — Jay to provide real HDFC CC statement. `detect_date_format()` should handle different date formats automatically; column layout may need parser adjustments.
+4. **Merge bank + CC data** — single dashboard view (depends on #3).
 5. **Medium priority** — transaction validation pre-write; persist reversal fields if needed for UI.
+
+---
+
+## UI Roadmap
+
+**Current state:** Basic Streamlit dashboard at `expenses/ui/dashboard.py` — 4 tabs (category breakdown, monthly trends, top merchants, transaction table), date + category filters, KPI cards.
+
+**Backend hooks already in place:**
+- `rebuild_enriched_ledger()` — call this when user updates rules; no re-ingestion needed
+- `category_overrides.csv` schema exists (not yet populated by code)
+- All derived fields (PaymentMode, CounterpartyGuess, TxnNote, IsReversal, NeedsReview, ReviewReason) are in enriched_ledger
+
+### Priority 1: Category Rule Manager
+**Goal:** Let user update categorization rules without editing JSON manually.
+
+- Table view of all rules in `category_mapping.json` (pattern, category, subcategory, merchant)
+- Add new rule form
+- Edit / delete existing rule
+- "Refresh Categorization" button → calls `rebuild_enriched_ledger()`, shows updated coverage %
+- **Why first:** Directly unblocks the 51% uncategorized problem; highest leverage feature
+
+### Priority 2: Dashboard Improvements
+**Goal:** Make spend numbers accurate and useful.
+
+Missing from current dashboard:
+- **Account filter** — filter by `AccountOrCardLast4` (currently all accounts merged)
+- **Flow filter** — separate INFLOW vs OUTFLOW views
+- **Exclude Internal Transfers toggle** — CC payments and own-account transfers inflate spend; should be off by default
+- **Reversal-aware totals** — exclude `IsReversal=1` rows from spend calculations (data already flagged, not used in dashboard)
+- **TxnNote column** in transaction details table
+- **PaymentMode breakdown** — chart showing spend split by UPI / ACH / NEFT / POS etc.
+
+### Priority 3: File Ingestion
+**Goal:** Move away from CLI; user uploads files from the UI.
+
+- File upload widget (.xls/.xlsx)
+- Institution dropdown (HDFC, ICICI, etc.)
+- Source Type dropdown (Bank Account, Credit Card)
+- Triggers ingestion pipeline, shows result: rows parsed / added / skipped
+- Upload history table from `uploaded_files.csv`
+
+### Priority 4: Review Queue
+**Goal:** Surface transactions that need manual attention.
+
+- Table of all rows where `NeedsReview=True`, grouped by `ReviewReason`:
+  - `NO_MATCH` — no category rule matched
+  - `MULTIPLE_MATCHES` — ambiguous categorization
+  - `REVERSAL_SUSPECTED` — potential refund pair
+  - `NO_DATE` — date could not be parsed
+- Allow user to set category manually for a row → writes to `category_overrides.csv`
+- **Note:** `category_overrides.csv` schema exists; backend logic to apply overrides during enrichment not yet implemented
+
+### Priority 5: Ingestion History (nice to have)
+- Table view of `ingestion_runs.csv` — run date, file, rows parsed/added/skipped
+- Table view of `uploaded_files.csv` — all files ever ingested with status
 
 ---
 

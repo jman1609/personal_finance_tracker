@@ -38,7 +38,7 @@
     {"pattern": "APOLLO PHARMACY", "category": "Health", "subcategory": "Pharmacy", "merchant": "Apollo Pharmacy"},
     {"pattern": "AKASH PHARMACY", "category": "Health", "subcategory": "Pharmacy", "merchant": "Akash Pharmacy"},
 
-    {"pattern": "AUTOPAY SI", "category": "Financial", "subcategory": "Credit Card Payment", "merchant": ""},
+    {"pattern": "AUTOPAY SI", "category": "Internal Transfer", "subcategory": "Credit Card Payment", "merchant": ""},
     {"pattern": "IB BILLPAY", "category": "Bills", "subcategory": "Bill Payment", "merchant": ""},
 
     {"pattern": "LOCKER RENT", "category": "Financial", "subcategory": "Bank Charges", "merchant": "HDFC Bank"},
